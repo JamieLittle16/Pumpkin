@@ -574,11 +574,11 @@ impl JavaClient {
 
                             // Resolve current loaded chunk from world level to ensure resnapshot
                             // operates on current state rather than a stale Arc if replaced.
-                            if let Some(loaded) = player.world().level.loaded_chunks.get(&chunk_pos) {
-                                if loaded.instance_id == instance_id {
-                                    active_chunk = loaded.clone();
-                                    continue 'delivery;
-                                }
+                            if let Some(loaded) = player.world().level.loaded_chunks.get(&chunk_pos)
+                                && loaded.instance_id == instance_id
+                            {
+                                active_chunk = loaded.clone();
+                                continue 'delivery;
                             }
                             break 'delivery;
                         }
@@ -1409,7 +1409,10 @@ mod chunk_delivery_tests {
         assert_eq!(state.journal.len(), 1);
         // Replacement instance 200 arrives: old delivery state is invalidated.
         let is_same_instance = state.instance_id == 200;
-        assert!(!is_same_instance, "Replacement instance MUST not match old active delivery state");
+        assert!(
+            !is_same_instance,
+            "Replacement instance MUST not match old active delivery state"
+        );
     }
 
     #[test]
@@ -1434,6 +1437,9 @@ mod chunk_delivery_tests {
         let state_epoch = 5u64;
         let caller_epoch = 4u64;
         let is_active = state_epoch == caller_epoch;
-        assert!(!is_active, "Stale epoch caller MUST not be able to remove delivery state");
+        assert!(
+            !is_active,
+            "Stale epoch caller MUST not be able to remove delivery state"
+        );
     }
 }
