@@ -103,7 +103,7 @@ impl BlockEntity for CommandBlockEntity {
     }
 
     fn is_dirty(&self) -> bool {
-        self.dirty.load(Ordering::Relaxed)
+        true
     }
 
     fn as_any(&self) -> &dyn std::any::Any {

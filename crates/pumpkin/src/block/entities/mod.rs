@@ -66,6 +66,12 @@ pub mod vault;
 pub use furnace_like_block_entity::ExperienceContainer;
 pub use pumpkin_world::block::entities::PropertyDelegate;
 
+#[derive(Clone, Debug)]
+pub struct BlockEntityPacketNbt {
+    pub initial_chunk: NbtCompound,
+    pub update: Option<NbtCompound>,
+}
+
 //TODO: We need a mark_dirty for chests
 pub trait BlockEntity: Any + Send + Sync {
     fn write_nbt<'a>(
@@ -128,6 +134,18 @@ pub trait BlockEntity: Any + Send + Sync {
         None
     }
 
+    /// Captures every client-visible representation of this block entity.
+    ///
+    /// Implementations whose full-chunk and update representations differ can
+    /// override this method without changing persistence NBT.
+    fn packet_nbt(&self) -> Option<BlockEntityPacketNbt> {
+        self.chunk_data_nbt()
+            .map(|initial_chunk| BlockEntityPacketNbt {
+                update: Some(initial_chunk.clone()),
+                initial_chunk,
+            })
+    }
+
     fn get_inventory(self: Arc<Self>) -> Option<Arc<dyn Inventory>> {
         None
     }
@@ -147,8 +165,24 @@ pub trait BlockEntity: Any + Send + Sync {
             }
         })
     }
+    /// Whether the entity has persistence-relevant changes that have not yet
+    /// been captured into its canonical record.
+    ///
+    /// The default is `true` so that entities without explicit dirtiness
+    /// tracking are always persisted. Inventory-style entities override this
+    /// with a dirty flag so that autosave only serialises entities that
+    /// actually changed.
     fn is_dirty(&self) -> bool {
-        false
+        true
+    }
+
+    /// Atomically claims the persistence dirty token and returns whether it
+    /// was dirty.
+    ///
+    /// Implementations with a dirty flag (`AtomicBool`) swap `false` into the flag using
+    /// `Ordering::AcqRel`.
+    fn take_dirty(&self) -> bool {
+        self.is_dirty()
     }
 
     fn clear_dirty(&self) {

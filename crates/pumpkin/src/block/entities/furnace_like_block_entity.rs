@@ -595,6 +595,14 @@ macro_rules! impl_block_entity_for_cooking {
                 self.dirty.load(Ordering::Relaxed)
             }
 
+            fn take_dirty(&self) -> bool {
+                self.dirty.swap(false, Ordering::AcqRel)
+            }
+
+            fn clear_dirty(&self) {
+                self.dirty.store(false, Ordering::Relaxed);
+            }
+
             fn chunk_data_nbt(&self) -> Option<pumpkin_nbt::compound::NbtCompound> {
                 let mut nbt = pumpkin_nbt::compound::NbtCompound::new();
                 nbt.put_short("cooking_total_time", self.get_cooking_total_time() as i16);

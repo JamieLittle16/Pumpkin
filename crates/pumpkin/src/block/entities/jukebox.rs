@@ -100,6 +100,14 @@ impl BlockEntity for JukeboxBlockEntity {
         self.dirty.load(Ordering::Relaxed)
     }
 
+    fn take_dirty(&self) -> bool {
+        self.dirty.swap(false, Ordering::AcqRel)
+    }
+
+    fn clear_dirty(&self) {
+        self.dirty.store(false, Ordering::Relaxed);
+    }
+
     fn chunk_data_nbt(&self) -> Option<NbtCompound> {
         let mut nbt = NbtCompound::new();
         if let Ok(record) = self.record_stack.try_lock()
