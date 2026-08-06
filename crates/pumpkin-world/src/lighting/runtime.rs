@@ -502,23 +502,23 @@ impl DynamicLightEngine {
     ) -> Result<(), String> {
         let (chunk_coordinate, relative) = position.chunk_and_chunk_relative_position();
         level.read_chunk_sync(&chunk_coordinate, |chunk| {
+            let mut mutation = chunk.begin_network_mutation();
             let section_index = (relative.y - chunk.section.min_y) as usize / BlockPalette::SIZE;
-            {
-                let mut light_engine = chunk
-                    .light_engine
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                if section_index >= light_engine.block_light.len() {
-                    return Err("Invalid section index".to_string());
-                }
-                let relative_y = (relative.y - chunk.section.min_y) as usize % BlockPalette::SIZE;
-                light_engine.block_light[section_index].set(
-                    relative.x as usize,
-                    relative_y,
-                    relative.z as usize,
-                    light_level,
-                );
-            };
+            let mut light_engine = chunk
+                .light_engine
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if section_index >= light_engine.block_light.len() {
+                return Err("Invalid section index".to_string());
+            }
+            let relative_y = (relative.y - chunk.section.min_y) as usize % BlockPalette::SIZE;
+            light_engine.block_light[section_index].set(
+                relative.x as usize,
+                relative_y,
+                relative.z as usize,
+                light_level,
+            );
+            mutation.mark_changed();
             // Mark chunk as dirty so lighting changes are saved to disk
             if !chunk.is_dirty() {
                 chunk.mark_dirty(true);
@@ -561,23 +561,23 @@ impl DynamicLightEngine {
     ) -> Result<(), String> {
         let (chunk_coordinate, relative) = position.chunk_and_chunk_relative_position();
         level.read_chunk_sync(&chunk_coordinate, |chunk| {
+            let mut mutation = chunk.begin_network_mutation();
             let section_index = (relative.y - chunk.section.min_y) as usize / BlockPalette::SIZE;
-            {
-                let mut light_engine = chunk
-                    .light_engine
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                if section_index >= light_engine.sky_light.len() {
-                    return Err("Invalid section index".to_string());
-                }
-                let relative_y = (relative.y - chunk.section.min_y) as usize % BlockPalette::SIZE;
-                light_engine.sky_light[section_index].set(
-                    relative.x as usize,
-                    relative_y,
-                    relative.z as usize,
-                    light_level,
-                );
-            };
+            let mut light_engine = chunk
+                .light_engine
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if section_index >= light_engine.sky_light.len() {
+                return Err("Invalid section index".to_string());
+            }
+            let relative_y = (relative.y - chunk.section.min_y) as usize % BlockPalette::SIZE;
+            light_engine.sky_light[section_index].set(
+                relative.x as usize,
+                relative_y,
+                relative.z as usize,
+                light_level,
+            );
+            mutation.mark_changed();
             // Mark chunk as dirty so lighting changes are saved to disk
             if !chunk.is_dirty() {
                 chunk.mark_dirty(true);

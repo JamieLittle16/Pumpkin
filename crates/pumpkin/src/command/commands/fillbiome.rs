@@ -99,6 +99,7 @@ impl CommandExecutor for FillBiomeExecutor {
                 let (has_replaced, count) = world
                     .level
                     .get_or_fetch_chunk(chunk_pos, |chunk| {
+                        let mut mutation = chunk.begin_network_mutation();
                         let mut local_count = 0;
                         let mut modified = false;
                         for &(rel_x, rel_y, rel_z) in &mods {
@@ -132,6 +133,9 @@ impl CommandExecutor for FillBiomeExecutor {
                                 }
                             }
                         }
+                        if modified {
+                            mutation.mark_changed();
+                        }
                         (modified, local_count)
                     })
                     .await;
@@ -142,7 +146,8 @@ impl CommandExecutor for FillBiomeExecutor {
                         .level
                         .get_or_fetch_chunk(chunk_pos, std::clone::Clone::clone)
                         .await;
-                    world.broadcast_to_chunk_except(chunk_pos, &[], &CChunkData(&chunk));
+                    let snapshot = chunk.network_snapshot();
+                    world.broadcast_to_chunk_except(chunk_pos, &[], &CChunkData(&snapshot));
                 }
             }
 

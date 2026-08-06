@@ -373,6 +373,9 @@ impl ChunkData {
         };
 
         Ok(Self {
+            instance_id: Self::next_instance_id(),
+            network_state_gate: std::sync::RwLock::new(()),
+            network_revision: AtomicU64::new(0),
             section,
             heightmap: std::sync::Mutex::new(heightmaps),
             x: position.x,

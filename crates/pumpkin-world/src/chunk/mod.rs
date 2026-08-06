@@ -26,6 +26,7 @@ pub const BIOME_VOLUME: usize = BiomePalette::VOLUME;
 pub const SUBCHUNK_VOLUME: usize = CHUNK_AREA * CHUNK_WIDTH;
 
 static NEXT_BLOCK_ENTITY_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
+static NEXT_CHUNK_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct BlockEntityType(pub u32);
@@ -177,6 +178,10 @@ pub enum CompressionError {
 
 // Clone here cause we want to clone a snapshot of the chunk so we don't block writing for too long
 pub struct ChunkData {
+    /// Unique for this loaded chunk object within the server process lifetime.
+    pub instance_id: u64,
+    pub network_state_gate: RwLock<()>,
+    pub network_revision: AtomicU64,
     pub section: ChunkSections,
     /// See `https://minecraft.wiki/w/Heightmap` for more info
     pub heightmap: std::sync::Mutex<ChunkHeightmaps>,
@@ -191,6 +196,58 @@ pub struct ChunkData {
     pub blending_data: Option<crate::generation::blender::blending_data::BlendingData>,
     pub dirty: AtomicBool,
     pub inhabited_time: AtomicU64,
+}
+
+pub struct NetworkMutationGuard<'a> {
+    gate: Option<std::sync::RwLockReadGuard<'a, ()>>,
+    revision: &'a AtomicU64,
+    changed: bool,
+}
+
+impl NetworkMutationGuard<'_> {
+    pub const fn mark_changed(&mut self) {
+        self.changed = true;
+    }
+}
+
+impl Drop for NetworkMutationGuard<'_> {
+    fn drop(&mut self) {
+        if self.changed {
+            self.revision
+                .fetch_update(Ordering::Release, Ordering::Relaxed, |current| {
+                    current.checked_add(1)
+                })
+                .expect("chunk network revision space exhausted");
+        }
+        // Explicitly release only after publishing the new revision.
+        drop(self.gate.take());
+    }
+}
+
+#[derive(Clone)]
+pub struct ChunkNetworkBlockEntity {
+    pub position: BlockPos,
+    pub block_entity_type: BlockEntityType,
+    pub initial_chunk: NbtCompound,
+}
+
+#[derive(Clone)]
+pub struct ChunkNetworkSnapshot {
+    pub instance_id: u64,
+    pub revision: u64,
+    pub x: i32,
+    pub z: i32,
+    pub block_sections: Box<[BlockPalette]>,
+    pub biome_sections: Box<[BiomePalette]>,
+    pub heightmaps: ChunkHeightmaps,
+    pub block_entities: Box<[ChunkNetworkBlockEntity]>,
+    pub lighting: ChunkLight,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct ChunkSnapshotIdentity {
+    pub instance_id: u64,
+    pub revision: u64,
 }
 
 pub struct ChunkEntityData {
@@ -696,6 +753,117 @@ impl ChunkSections {
 }
 
 impl ChunkData {
+    #[must_use]
+    pub fn new_empty(x: i32, z: i32, section_count: usize, min_y: i32) -> Self {
+        Self {
+            instance_id: Self::next_instance_id(),
+            network_state_gate: RwLock::new(()),
+            network_revision: AtomicU64::new(0),
+            section: ChunkSections::new(section_count, min_y),
+            heightmap: std::sync::Mutex::new(ChunkHeightmaps::default()),
+            x,
+            z,
+            block_ticks: ChunkTickScheduler::default(),
+            fluid_ticks: ChunkTickScheduler::default(),
+            block_entities: std::sync::Mutex::default(),
+            light_engine: std::sync::Mutex::new(ChunkLight::default()),
+            light_populated: AtomicBool::new(false),
+            status: ChunkStatus::Empty,
+            blending_data: None,
+            dirty: AtomicBool::new(false),
+            inhabited_time: AtomicU64::new(0),
+        }
+    }
+
+    #[must_use]
+    pub fn next_instance_id() -> u64 {
+        NEXT_CHUNK_INSTANCE_ID
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                current.checked_add(1)
+            })
+            .expect("chunk instance ID space exhausted")
+    }
+
+    #[must_use]
+    pub fn begin_network_mutation(&self) -> NetworkMutationGuard<'_> {
+        NetworkMutationGuard {
+            gate: Some(
+                self.network_state_gate
+                    .read()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+            ),
+            revision: &self.network_revision,
+            changed: false,
+        }
+    }
+
+    #[must_use]
+    pub fn network_revision(&self) -> u64 {
+        self.network_revision.load(Ordering::Acquire)
+    }
+
+    #[must_use]
+    pub fn network_identity(&self) -> ChunkSnapshotIdentity {
+        ChunkSnapshotIdentity {
+            instance_id: self.instance_id,
+            revision: self.network_revision(),
+        }
+    }
+
+    #[must_use]
+    pub fn network_snapshot(&self) -> ChunkNetworkSnapshot {
+        let _snapshot_guard = self
+            .network_state_gate
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let revision = self.network_revision.load(Ordering::Acquire);
+        let block_sections = self
+            .section
+            .block_sections
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let biome_sections = self
+            .section
+            .biome_sections
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let heightmaps = self
+            .heightmap
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let block_entities = self
+            .block_entities
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .map(|(position, record)| ChunkNetworkBlockEntity {
+                position: *position,
+                block_entity_type: record.block_entity_type,
+                initial_chunk: record.initial_chunk.clone(),
+            })
+            .collect();
+        let lighting = self
+            .light_engine
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+
+        ChunkNetworkSnapshot {
+            instance_id: self.instance_id,
+            revision,
+            x: self.x,
+            z: self.z,
+            block_sections,
+            biome_sections,
+            heightmaps,
+            block_entities,
+            lighting,
+        }
+    }
+
     /// Returns the replaced block state ID
     pub fn set_block_absolute_y(
         &self,
@@ -704,6 +872,7 @@ impl ChunkData {
         relative_z: usize,
         block_state_id: BlockStateId,
     ) -> BlockStateId {
+        let mut mutation = self.begin_network_mutation();
         let min_y = self.section.min_y;
         let y_rel = y - min_y;
         if y_rel < 0 {
@@ -720,6 +889,7 @@ impl ChunkData {
         if old != block_state_id {
             let state = BlockState::from_id(block_state_id);
             self.update_heightmap(relative_x, relative_y, relative_z, state);
+            mutation.mark_changed();
         }
         old
     }
@@ -880,6 +1050,9 @@ impl ChunkData {
     #[must_use]
     pub fn empty_chunk(x: i32, z: i32) -> Self {
         Self {
+            instance_id: Self::next_instance_id(),
+            network_state_gate: RwLock::new(()),
+            network_revision: AtomicU64::new(0),
             section: ChunkSections::new(1, 0),
             heightmap: std::sync::Mutex::new(ChunkHeightmaps::default()),
             x,
@@ -889,7 +1062,7 @@ impl ChunkData {
             block_entities: std::sync::Mutex::default(),
             light_engine: std::sync::Mutex::new(ChunkLight::default()),
             light_populated: AtomicBool::new(false),
-            status: pumpkin_data::chunk::ChunkStatus::Empty,
+            status: ChunkStatus::Empty,
             blending_data: None,
             dirty: AtomicBool::new(false),
             inhabited_time: AtomicU64::new(0),
@@ -915,16 +1088,66 @@ pub enum ChunkSerializingError {
 
 #[cfg(test)]
 mod tests {
-    use super::{CanonicalBlockEntityNbt, CanonicalCommitResult, ChunkSections};
+    use super::{
+        CanonicalBlockEntityNbt, CanonicalCommitResult, ChunkData, ChunkHeightmaps, ChunkLight,
+        ChunkSections,
+    };
     use crate::chunk::palette::BlockPalette;
+    use crate::tick::scheduler::ChunkTickScheduler;
+    use pumpkin_data::chunk::ChunkStatus;
     use pumpkin_data::{Block, block_properties::has_random_ticks};
     use pumpkin_nbt::compound::NbtCompound;
+    use std::sync::atomic::{AtomicBool, AtomicU64};
+    use std::sync::{Arc, Mutex, RwLock};
 
     fn block_entity_nbt(value: i32) -> NbtCompound {
         let mut nbt = NbtCompound::new();
         nbt.put_string("id", "minecraft:furnace".to_owned());
         nbt.put_int("value", value);
         nbt
+    }
+
+    fn empty_chunk() -> ChunkData {
+        ChunkData {
+            instance_id: ChunkData::next_instance_id(),
+            network_state_gate: RwLock::new(()),
+            network_revision: AtomicU64::new(0),
+            section: ChunkSections::new(1, 0),
+            heightmap: Mutex::new(ChunkHeightmaps::default()),
+            x: 0,
+            z: 0,
+            block_ticks: ChunkTickScheduler::default(),
+            fluid_ticks: ChunkTickScheduler::default(),
+            block_entities: Mutex::default(),
+            light_engine: Mutex::new(ChunkLight::default()),
+            light_populated: AtomicBool::new(false),
+            status: ChunkStatus::Full,
+            blending_data: None,
+            dirty: AtomicBool::new(false),
+            inhabited_time: AtomicU64::new(0),
+        }
+    }
+
+    #[test]
+    fn snapshot_waits_for_revisioned_mutation_to_commit() {
+        let chunk = Arc::new(empty_chunk());
+        let mut mutation = chunk.begin_network_mutation();
+        chunk
+            .section
+            .set_block_absolute_y(0, 0, 0, Block::STONE.default_state.id);
+        mutation.mark_changed();
+
+        let snapshot_chunk = Arc::clone(&chunk);
+        let snapshot_thread = std::thread::spawn(move || snapshot_chunk.network_snapshot());
+        assert!(!snapshot_thread.is_finished());
+
+        drop(mutation);
+        let snapshot = snapshot_thread.join().unwrap();
+        assert_eq!(snapshot.revision, 1);
+        assert_eq!(
+            snapshot.block_sections[0].get(0, 0, 0),
+            Block::STONE.default_state.id
+        );
     }
 
     #[test]

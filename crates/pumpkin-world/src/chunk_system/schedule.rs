@@ -182,6 +182,7 @@ impl GenerationSchedule {
     fn apply_lighting_override(&self, chunk: &SyncChunk) {
         match self.lighting_config {
             LightingEngineConfig::Full => {
+                let mut mutation = chunk.begin_network_mutation();
                 let mut engine = chunk.light_engine.lock().unwrap();
                 for section in &mut engine.block_light {
                     section.fill(15);
@@ -190,8 +191,10 @@ impl GenerationSchedule {
                     section.fill(15);
                 }
                 chunk.dirty.store(true, Relaxed);
+                mutation.mark_changed();
             }
             LightingEngineConfig::Dark => {
+                let mut mutation = chunk.begin_network_mutation();
                 let mut engine = chunk.light_engine.lock().unwrap();
                 for section in &mut engine.block_light {
                     section.fill(0);
@@ -200,6 +203,7 @@ impl GenerationSchedule {
                     section.fill(0);
                 }
                 chunk.dirty.store(true, Relaxed);
+                mutation.mark_changed();
             }
             LightingEngineConfig::Default => {}
         }

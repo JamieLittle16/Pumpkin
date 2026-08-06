@@ -8,7 +8,7 @@ use pumpkin_macros::java_packet;
 use pumpkin_util::math::position::get_local_cord;
 use pumpkin_util::version::JavaMinecraftVersion;
 use pumpkin_world::chunk::format::LightContainer;
-use pumpkin_world::chunk::{ChunkData, palette::NetworkPalette};
+use pumpkin_world::chunk::{ChunkNetworkSnapshot, palette::NetworkPalette};
 use std::io::Write;
 
 /// Sent by the server to provide the client with the full data for a chunk.
@@ -17,7 +17,7 @@ use std::io::Write;
 /// block entities (like signs or chests), and the light level information for both
 /// sky and block light.
 #[java_packet(PLAY_LEVEL_CHUNK_WITH_LIGHT)]
-pub struct CChunkData<'a>(pub &'a ChunkData);
+pub struct CChunkData<'a>(pub &'a ChunkNetworkSnapshot);
 
 impl ClientPacket for CChunkData<'_> {
     #[expect(clippy::too_many_lines)]
@@ -31,11 +31,7 @@ impl ClientPacket for CChunkData<'_> {
         // Chunk Z
         write.write_i32_be(self.0.z)?;
 
-        let heightmaps = self
-            .0
-            .heightmap
-            .lock()
-            .map_err(|_| WritingError::Message("heightmap lock poisoned".into()))?;
+        let heightmaps = &self.0.heightmaps;
         if version <= &JavaMinecraftVersion::V_1_21_4 {
             let mut comp = pumpkin_nbt::compound::NbtCompound::new();
             if let Some(ref ws) = heightmaps.world_surface {
@@ -80,18 +76,10 @@ impl ClientPacket for CChunkData<'_> {
                     .unwrap_or(&[0; 37]),
             )?;
         }
-        drop(heightmaps);
-
         {
             let mut blocks_and_biomes_buf = Vec::new();
-            let block_sections =
-                self.0.section.block_sections.read().map_err(|_| {
-                    WritingError::Message("block_sections read lock poisoned".into())
-                })?;
-            let biome_sections =
-                self.0.section.biome_sections.read().map_err(|_| {
-                    WritingError::Message("biome_sections read lock poisoned".into())
-                })?;
+            let block_sections = &self.0.block_sections;
+            let biome_sections = &self.0.biome_sections;
 
             for (block_palette, biome_palette) in block_sections.iter().zip(biome_sections.iter()) {
                 let non_empty_block_count = block_palette.non_air_block_count() as i16;
@@ -211,13 +199,10 @@ impl ClientPacket for CChunkData<'_> {
             write.write_slice(&blocks_and_biomes_buf)?;
         };
 
-        let block_entities = self
-            .0
-            .block_entities
-            .lock()
-            .map_err(|_| WritingError::Message("block_entities lock poisoned".into()))?;
+        let block_entities = &self.0.block_entities;
         write.write_var_int(&VarInt(block_entities.len() as i32))?;
-        for (pos, record) in block_entities.iter() {
+        for record in block_entities {
+            let pos = &record.position;
             let nbt = &record.initial_chunk;
             let local_xz = ((get_local_cord(pos.0.x) & 0xF) << 4) | (get_local_cord(pos.0.z) & 0xF);
 
@@ -237,11 +222,7 @@ impl ClientPacket for CChunkData<'_> {
         {
             // Light masks include sections from -1 (below world) to num_sections (above world)
             // This means we need to account for 2 extra sections in the bitset
-            let light_engine = self
-                .0
-                .light_engine
-                .lock()
-                .map_err(|_| WritingError::Message("light_engine lock poisoned".into()))?;
+            let light_engine = &self.0.lighting;
             let num_sections = light_engine.sky_light.len();
 
             let mut sky_light_empty_mask = 0u64;
