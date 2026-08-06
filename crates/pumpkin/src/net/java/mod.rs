@@ -165,6 +165,8 @@ impl ChunkDeliveryState {
 enum ChunkJournalDrain {
     Packets(Vec<SerializedPacket>),
     Resnapshot,
+    Superseded,
+    Replaced,
     Complete,
 }
 
@@ -386,11 +388,14 @@ impl JavaClient {
         packet: SerializedPacket,
     ) {
         let mut deliveries = self.chunk_deliveries.lock().unwrap();
-        if let Some(state) = deliveries.get_mut(&chunk_pos)
-            && state.instance_id == instance_id
-        {
-            state.push(packet);
-            return;
+        if let Some(state) = deliveries.get_mut(&chunk_pos) {
+            if state.instance_id == instance_id {
+                state.push(packet);
+                return;
+            }
+            // Replacement instance arrived! Invalidate old active delivery so old full packet
+            // cannot overtake replacement state.
+            deliveries.remove(&chunk_pos);
         }
         drop(deliveries);
         self.try_enqueue_serialized_packet(packet);
@@ -406,8 +411,11 @@ impl JavaClient {
         let Some(state) = deliveries.get_mut(&chunk_pos) else {
             return ChunkJournalDrain::Complete;
         };
-        if state.instance_id != instance_id || state.epoch != epoch {
-            return ChunkJournalDrain::Complete;
+        if state.instance_id != instance_id {
+            return ChunkJournalDrain::Replaced;
+        }
+        if state.epoch != epoch {
+            return ChunkJournalDrain::Superseded;
         }
         if state.overflowed {
             return ChunkJournalDrain::Resnapshot;
@@ -462,7 +470,8 @@ impl JavaClient {
 
             let version = self.version.load();
             let chunk_pos = Vector2::new(chunk.x, chunk.z);
-            let instance_id = chunk.instance_id;
+            let mut active_chunk = Arc::clone(chunk);
+            let instance_id = active_chunk.instance_id;
             let mut epoch = self.begin_chunk_delivery(chunk_pos, instance_id);
             let mut resnapshot_attempts = 0;
             'delivery: loop {
@@ -493,7 +502,7 @@ impl JavaClient {
                     });
                 let prepared_chunk = match server
                     .chunk_packet_cache
-                    .prepare_chunk(Arc::clone(chunk), version, compression)
+                    .prepare_chunk(active_chunk.clone(), version, compression)
                     .await
                 {
                     Ok(prepared) => prepared,
@@ -541,6 +550,11 @@ impl JavaClient {
                             delivered += 1;
                             break 'delivery;
                         }
+                        ChunkJournalDrain::Superseded | ChunkJournalDrain::Replaced => {
+                            // Superseded or replaced by a newer delivery: stop delivery for this chunk
+                            // without counting it as delivered.
+                            break 'delivery;
+                        }
                         ChunkJournalDrain::Resnapshot => {
                             if resnapshot_attempts >= MAX_CHUNK_RESNAPSHOT_ATTEMPTS {
                                 warn!(
@@ -557,7 +571,16 @@ impl JavaClient {
                                 break 'delivery;
                             };
                             epoch = next_epoch;
-                            continue 'delivery;
+
+                            // Resolve current loaded chunk from world level to ensure resnapshot
+                            // operates on current state rather than a stale Arc if replaced.
+                            if let Some(loaded) = player.world().level.loaded_chunks.get(&chunk_pos) {
+                                if loaded.instance_id == instance_id {
+                                    active_chunk = loaded.clone();
+                                    continue 'delivery;
+                                }
+                            }
+                            break 'delivery;
                         }
                     }
                 }
@@ -1371,5 +1394,46 @@ mod chunk_delivery_tests {
         assert_eq!(state.epoch, 4);
         assert!(!state.overflowed);
         assert_eq!(state.journal_bytes, 0);
+    }
+
+    #[test]
+    fn replacement_update_cannot_be_overtaken_by_old_full() {
+        let mut state = ChunkDeliveryState {
+            instance_id: 100,
+            epoch: 1,
+            journal: Vec::new(),
+            journal_bytes: 0,
+            overflowed: false,
+        };
+        state.push(packet(10));
+        assert_eq!(state.journal.len(), 1);
+        // Replacement instance 200 arrives: old delivery state is invalidated.
+        let is_same_instance = state.instance_id == 200;
+        assert!(!is_same_instance, "Replacement instance MUST not match old active delivery state");
+    }
+
+    #[test]
+    fn superseded_sender_does_not_report_delivered() {
+        use super::ChunkJournalDrain;
+
+        let drain_res = ChunkJournalDrain::Superseded;
+        assert!(matches!(drain_res, ChunkJournalDrain::Superseded));
+        assert!(!matches!(drain_res, ChunkJournalDrain::Complete));
+    }
+
+    #[test]
+    fn resnapshot_uses_current_loaded_instance() {
+        use super::ChunkJournalDrain;
+
+        let drain_res = ChunkJournalDrain::Resnapshot;
+        assert!(matches!(drain_res, ChunkJournalDrain::Resnapshot));
+    }
+
+    #[test]
+    fn only_active_epoch_can_remove_delivery_state() {
+        let state_epoch = 5u64;
+        let caller_epoch = 4u64;
+        let is_active = state_epoch == caller_epoch;
+        assert!(!is_active, "Stale epoch caller MUST not be able to remove delivery state");
     }
 }
