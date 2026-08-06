@@ -1152,7 +1152,7 @@ mod tests {
     async fn in_flight_metric_includes_queued_preparations() {
         let cache = cache(64, 1);
         let (entered_tx, entered_rx) = std::sync::mpsc::channel();
-        let (second_entered_tx, second_entered_rx) = std::sync::mpsc::channel();
+        let (second_entered_tx, _second_entered_rx) = std::sync::mpsc::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel();
         let release_rx = std::sync::Mutex::new(release_rx);
         let second_entered_tx = std::sync::Mutex::new(second_entered_tx);

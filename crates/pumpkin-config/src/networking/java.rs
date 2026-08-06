@@ -3,11 +3,15 @@ use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 use std::num::NonZeroU8;
 
+/// Configuration for the chunk packet cache.
 #[derive(Deserialize, Serialize, Clone)]
 #[serde(default)]
 pub struct ChunkPacketCacheConfig {
+    /// Whether the chunk packet cache is enabled.
     pub enabled: bool,
+    /// Cache capacity in MiB.
     pub capacity_mib: usize,
+    /// Number of dedicated preparation threads.
     pub preparation_threads: usize,
 }
 
