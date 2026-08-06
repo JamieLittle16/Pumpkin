@@ -1152,11 +1152,20 @@ mod tests {
     async fn in_flight_metric_includes_queued_preparations() {
         let cache = cache(64, 1);
         let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (second_entered_tx, second_entered_rx) = std::sync::mpsc::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel();
         let release_rx = std::sync::Mutex::new(release_rx);
+        let second_entered_tx = std::sync::Mutex::new(second_entered_tx);
+        let count = std::sync::atomic::AtomicUsize::new(0);
+
         *cache.before_snapshot.lock().unwrap() = Some(Arc::new(move |_| {
-            entered_tx.send(()).unwrap();
-            release_rx.lock().unwrap().recv().unwrap();
+            let n = count.fetch_add(1, Ordering::Relaxed);
+            if n == 0 {
+                entered_tx.send(()).unwrap();
+                release_rx.lock().unwrap().recv().unwrap();
+            } else {
+                second_entered_tx.lock().unwrap().send(()).unwrap();
+            }
         }));
 
         let first_cache = Arc::clone(&cache);
@@ -1181,7 +1190,11 @@ mod tests {
                 .await
                 .unwrap();
         });
-        tokio::task::yield_now().await;
+
+        // The second preparation is queued to in-flight metrics deterministically.
+        while cache.metrics().preparations_in_flight < 2 {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
         assert_eq!(cache.metrics().preparations_in_flight, 2);
 
         release_tx.send(()).unwrap();
