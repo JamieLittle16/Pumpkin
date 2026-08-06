@@ -23,6 +23,7 @@ use key_store::KeyStore;
 use pumpkin_config::{AdvancedConfiguration, BasicConfiguration};
 use pumpkin_data::dimension::Dimension;
 use pumpkin_data::entity::EntityType;
+use pumpkin_util::background_cpu::BackgroundCpuBudget;
 use pumpkin_util::permission::{PermissionManager, PermissionRegistry};
 use pumpkin_util::text::color::NamedColor;
 use pumpkin_world::dimension::into_level;
@@ -51,6 +52,7 @@ use tokio::sync::{Mutex, OnceCell, RwLock};
 use tokio::task::{JoinHandle, JoinSet};
 use tokio_util::task::TaskTracker;
 
+pub mod chunk_packet_cache;
 mod connection_cache;
 mod key_store;
 pub mod recipe;
@@ -71,6 +73,8 @@ use crate::server::scheduler::TaskScheduler;
 pub struct Server {
     pub basic_config: BasicConfiguration,
     pub advanced_config: AdvancedConfiguration,
+    pub chunk_packet_cache: Arc<chunk_packet_cache::ChunkPacketCache>,
+    pub background_cpu_budget: Arc<BackgroundCpuBudget>,
 
     pub data: VanillaData,
 
@@ -254,8 +258,36 @@ impl Server {
                 .collect::<Vec<_>>()
         );
 
+        let preparation_threads = advanced_config
+            .networking
+            .java
+            .chunk_packet_cache
+            .preparation_threads
+            .max(1);
+        let background_cpu_budget = Arc::new(BackgroundCpuBudget::automatic(preparation_threads));
+        info!(
+            "Background CPU budget: total={}, generation={}, chunk-packet={}",
+            background_cpu_budget.capacity(),
+            background_cpu_budget.generation_limit(),
+            background_cpu_budget.packet_preparation_limit()
+        );
+
         let server = Self {
             basic_config,
+            chunk_packet_cache: Arc::new(chunk_packet_cache::ChunkPacketCache::new(
+                if advanced_config.networking.java.chunk_packet_cache.enabled {
+                    advanced_config
+                        .networking
+                        .java
+                        .chunk_packet_cache
+                        .capacity_mib
+                } else {
+                    0
+                },
+                preparation_threads,
+                Arc::clone(&background_cpu_budget),
+            )),
+            background_cpu_budget,
             advanced_config,
             data: vanilla_data,
             plugin_manager: Arc::new(PluginManager::new()),
@@ -319,6 +351,7 @@ impl Server {
             let weak = Arc::downgrade(&server);
             let config = Arc::new(server.advanced_config.world.clone());
             let pool = gen_pool.clone();
+            let background_cpu_budget = Arc::clone(&server.background_cpu_budget);
 
             tokio::task::spawn_blocking(move || {
                 info!(
@@ -327,7 +360,14 @@ impl Server {
                         .color_named(NamedColor::DarkGreen)
                         .to_pretty_console()
                 );
-                let level = into_level(dim.clone(), &config, path, seed, Some(pool));
+                let level = into_level(
+                    dim.clone(),
+                    &config,
+                    path,
+                    seed,
+                    Some(pool),
+                    Some(background_cpu_budget),
+                );
                 let world = Arc::new(World::load(level.clone(), l_info, dim, registry, weak));
                 let portal: Arc<dyn WorldPortalExt> = Arc::new(WorldPortal(world.clone()));
                 level.world_portal.store(Arc::new(Some(portal)));
@@ -438,6 +478,7 @@ impl Server {
                 world_path,
                 seed,
                 None,
+                Some(Arc::clone(&server.background_cpu_budget)),
             );
             let world: World = World::load(level.clone(), l_info, dimension, registry, weak);
             let world = Arc::new(world);

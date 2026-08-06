@@ -3,6 +3,24 @@ use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 use std::num::NonZeroU8;
 
+#[derive(Deserialize, Serialize, Clone)]
+#[serde(default)]
+pub struct ChunkPacketCacheConfig {
+    pub enabled: bool,
+    pub capacity_mib: usize,
+    pub preparation_threads: usize,
+}
+
+impl Default for ChunkPacketCacheConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            capacity_mib: 64,
+            preparation_threads: 2,
+        }
+    }
+}
+
 /// Configuration for Java Edition client connections.
 #[derive(Deserialize, Serialize, Clone)]
 #[serde(default)]
@@ -23,6 +41,8 @@ pub struct JavaConfig {
     pub simulation_distance: NonZeroU8,
     /// Java Edition packet compression settings.
     pub compression: CompressionConfig,
+    /// Shared preparation cache for Java full-chunk packets.
+    pub chunk_packet_cache: ChunkPacketCacheConfig,
     /// Message of the Day; the server's description displayed on the status screen.
     pub motd: String,
     /// Authentication settings for client connections.
@@ -40,6 +60,7 @@ impl Default for JavaConfig {
             view_distance: NonZeroU8::new(16).unwrap(),
             simulation_distance: NonZeroU8::new(10).unwrap(),
             compression: CompressionConfig::default(),
+            chunk_packet_cache: ChunkPacketCacheConfig::default(),
             motd: "A blazingly fast Pumpkin server!".to_string(),
             authentication: AuthenticationConfig::default(),
         }

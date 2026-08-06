@@ -10,6 +10,7 @@ use crossfire::compat::AsyncRx;
 use pumpkin_config::lighting::LightingEngineConfig;
 use pumpkin_data::chunk::ChunkStatus;
 use pumpkin_data::chunk_gen_settings::GenerationSettings;
+use pumpkin_util::background_cpu::BackgroundCpuCategory;
 use std::collections::hash_map::Entry;
 use std::sync::Arc;
 use std::sync::atomic::Ordering::Relaxed;
@@ -273,6 +274,10 @@ pub fn generation_work(
             break;
         };
 
+        let _permit = level
+            .background_cpu_budget
+            .as_deref()
+            .map(|budget| budget.acquire(BackgroundCpuCategory::Generation));
         let result = run_generation(pos, cache, stage, level, settings);
         if send.send((pos, result)).is_err() {
             break;
