@@ -1159,7 +1159,7 @@ mod tests {
         let count = std::sync::atomic::AtomicUsize::new(0);
 
         *cache.before_snapshot.lock().unwrap() = Some(Arc::new(move |_| {
-            let n = count.fetch_add(1, Ordering::Relaxed);
+            let n = count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             if n == 0 {
                 entered_tx.send(()).unwrap();
                 release_rx.lock().unwrap().recv().unwrap();
