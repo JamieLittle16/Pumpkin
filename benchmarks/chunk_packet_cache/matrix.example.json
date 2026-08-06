@@ -1,0 +1,27 @@
+[
+  {
+    "name": "master",
+    "binary": "/tmp/pumpkin-bench-target-master/release/pumpkin",
+    "cache_enabled": false,
+    "capacity_mib": 0
+  },
+  {
+    "name": "old-2490",
+    "binary": "/tmp/pumpkin-bench-target-old/release/pumpkin",
+    "cache_enabled": true,
+    "capacity_mib": 64
+  },
+  {
+    "name": "stack-disabled",
+    "binary": "/tmp/pumpkin-bench-target-stack/release/pumpkin",
+    "cache_enabled": false,
+    "capacity_mib": 0
+  },
+  {
+    "name": "stack-enabled",
+    "binary": "/tmp/pumpkin-bench-target-stack/release/pumpkin",
+    "cache_enabled": true,
+    "capacity_mib": 64
+  }
+]
+

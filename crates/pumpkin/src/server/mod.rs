@@ -46,7 +46,7 @@ use std::collections::HashSet;
 use std::fs;
 use std::net::IpAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicU32};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicU32, AtomicU64};
 use std::{future::Future, sync::atomic::Ordering, time::Duration};
 use tokio::sync::{Mutex, OnceCell, RwLock};
 use tokio::task::{JoinHandle, JoinSet};
@@ -132,6 +132,12 @@ pub struct Server {
     pub tick_times_nanos: Mutex<[i64; 100]>,
     /// Aggregated tick times for efficient rolling average calculation
     pub aggregated_tick_times_nanos: AtomicI64,
+    /// Longest single tick duration observed, in nanoseconds
+    pub tick_max_nanos: AtomicI64,
+    /// Number of ticks exceeding the 50 ms tick budget
+    pub ticks_over_50ms: AtomicU64,
+    /// Number of ticks exceeding 100 ms
+    pub ticks_over_100ms: AtomicU64,
     /// Total number of ticks processed by the server
     pub tick_count: AtomicI32,
     /// Random unique Server ID used by Bedrock Edition
@@ -317,6 +323,9 @@ impl Server {
             tick_rate_manager,
             tick_times_nanos: Mutex::new([0; 100]),
             aggregated_tick_times_nanos: AtomicI64::new(0),
+            tick_max_nanos: AtomicI64::new(0),
+            ticks_over_50ms: AtomicU64::new(0),
+            ticks_over_100ms: AtomicU64::new(0),
             tick_count: AtomicI32::new(0),
             tasks: TaskTracker::new(),
             runtime: tokio::runtime::Handle::current(),
@@ -644,6 +653,10 @@ impl Server {
         self.tasks.wait().await;
         debug!("Done awaiting tasks for server");
 
+        if std::env::var_os("PUMPKIN_BENCHMARK_METRICS").is_some() {
+            self.log_benchmark_metrics().await;
+        }
+
         info!("Starting worlds");
         for world in self.worlds.load().iter() {
             world.shutdown().await;
@@ -658,6 +671,61 @@ impl Server {
             error!("Failed to save level.dat: {err}");
         }
         info!("Completed worlds");
+    }
+
+    async fn log_benchmark_metrics(&self) {
+        let cache = self.chunk_packet_cache.metrics();
+        let mut tick_times = self
+            .get_tick_times_nanos_copy()
+            .await
+            .into_iter()
+            .filter(|sample| *sample > 0)
+            .collect::<Vec<_>>();
+        tick_times.sort_unstable();
+
+        let percentile_ms = |percentile: usize| {
+            if tick_times.is_empty() {
+                return 0.0;
+            }
+            let index = (tick_times.len() - 1).saturating_mul(percentile) / 100;
+            tick_times[index] as f64 / 1_000_000.0
+        };
+
+        let metrics = serde_json::json!({
+            "schema": 1,
+            "tick_samples": tick_times.len(),
+            "tick_p50_ms": percentile_ms(50),
+            "tick_p95_ms": percentile_ms(95),
+            "tick_p99_ms": percentile_ms(99),
+            "tick_max_ms": self.tick_max_nanos.load(Ordering::Relaxed) as f64 / 1_000_000.0,
+            "ticks_over_50ms": self.ticks_over_50ms.load(Ordering::Relaxed),
+            "ticks_over_100ms": self.ticks_over_100ms.load(Ordering::Relaxed),
+            "serialization_hits": cache.serialization_hits,
+            "serialization_misses": cache.serialization_misses,
+            "serialization_waiters": cache.serialization_waiters,
+            "preparation_hits": cache.preparation_hits,
+            "preparation_misses": cache.preparation_misses,
+            "preparation_waiters": cache.preparation_waiters,
+            "snapshot_captures": cache.snapshot_captures,
+            "obsolete_snapshot_attempts": cache.obsolete_snapshot_attempts,
+            "snapshot_nanos": cache.snapshot_nanos,
+            "serialization_nanos": cache.serialization_nanos,
+            "compression_nanos": cache.compression_nanos,
+            "background_permit_acquisitions": cache.background_permit_acquisitions,
+            "background_permit_wait_nanos": cache.background_permit_wait_nanos,
+            "retained_bytes": cache.retained_bytes,
+            "capacity_bytes": cache.capacity_bytes,
+            "retention_entries": cache.retention_entries,
+            "cache_cells": cache.cache_cells,
+            "preparations_in_flight": cache.preparations_in_flight,
+            "generation_permit_acquisitions": self.background_cpu_budget.acquisitions(
+                pumpkin_util::background_cpu::BackgroundCpuCategory::Generation,
+            ),
+            "generation_permit_wait_nanos": self.background_cpu_budget.wait_nanos(
+                pumpkin_util::background_cpu::BackgroundCpuCategory::Generation,
+            ),
+        });
+        info!("PUMPKIN_BENCHMARK_METRICS {metrics}");
     }
 
     /// Broadcasts a packet to all players in all worlds.
@@ -982,6 +1050,15 @@ impl Server {
     pub async fn update_tick_times(&self, tick_duration_nanos: i64) {
         let tick_count = self.tick_count.fetch_add(1, Ordering::Relaxed);
         let index = (tick_count % 100) as usize;
+
+        self.tick_max_nanos
+            .fetch_max(tick_duration_nanos, Ordering::Relaxed);
+        if tick_duration_nanos > 50_000_000 {
+            self.ticks_over_50ms.fetch_add(1, Ordering::Relaxed);
+        }
+        if tick_duration_nanos > 100_000_000 {
+            self.ticks_over_100ms.fetch_add(1, Ordering::Relaxed);
+        }
 
         let mut tick_times = self.tick_times_nanos.lock().await;
         let old_time = tick_times[index];

@@ -1,0 +1,172 @@
+diff --git a/src/client.rs b/src/client.rs
+index 384b750..6305b16 100644
+--- a/src/client.rs
++++ b/src/client.rs
+@@ -4,15 +4,17 @@ use pumpkin_protocol::java::client::config::{CConfigDisconnect, CFinishConfig};
+ use pumpkin_protocol::java::client::login::{
+     CEncryptionRequest, CLoginDisconnect, CLoginSuccess, CSetCompression,
+ };
+-use pumpkin_protocol::java::client::play::{CKeepAlive, CLogin, CPlayDisconnect, CPlayerPosition};
++use pumpkin_protocol::java::client::play::{
++    CChunkBatchEnd, CChunkData, CKeepAlive, CLogin, CPlayDisconnect, CPlayerPosition,
++};
+ use pumpkin_protocol::java::packet_decoder::TCPNetworkDecoder;
+ use pumpkin_protocol::java::packet_encoder::TCPNetworkEncoder;
+ use pumpkin_protocol::java::server::config::{SAcknowledgeFinishConfig, SKnownPacks};
+ use pumpkin_protocol::java::server::handshake::SHandShake;
+ use pumpkin_protocol::java::server::login::{SLoginAcknowledged, SLoginStart};
+ use pumpkin_protocol::java::server::play::{
+-    SChatMessage, SConfirmTeleport, SKeepAlive, SPlayerLoaded, SPlayerPosition, SPlayerRotation,
+-    SSwingArm,
++    SChatMessage, SChunkBatch, SConfirmTeleport, SKeepAlive, SPlayerLoaded, SPlayerPosition,
++    SPlayerRotation, SSwingArm,
+ };
+ use pumpkin_protocol::packet::MultiVersionJavaPacket;
+ use pumpkin_protocol::ser::NetworkWriteExt;
+@@ -43,6 +45,26 @@ use crate::Args;
+ 
+ pub const VERSION: JavaMinecraftVersion = JavaMinecraftVersion::V_26_2;
+ 
++struct ChunkBatchAck {
++    chunks_per_tick: f32,
++}
++
++impl MultiVersionJavaPacket for ChunkBatchAck {
++    fn to_id(version: JavaMinecraftVersion) -> i32 {
++        SChunkBatch::to_id(version)
++    }
++}
++
++impl ClientPacket for ChunkBatchAck {
++    fn write_packet_data(
++        &self,
++        mut write: impl Write,
++        _version: &JavaMinecraftVersion,
++    ) -> Result<(), WritingError> {
++        write.write_f32_be(self.chunks_per_tick)
++    }
++}
++
+ /// Everything which makes a Connection with our Server is a `Client`.
+ #[expect(dead_code)]
+ pub struct Client {
+@@ -60,6 +82,8 @@ pub struct Client {
+ 
+     message_spam_cooldown: AtomicU32,
+     message_count: AtomicU32,
++    chunk_count: AtomicU32,
++    chunk_batch_count: AtomicU32,
+     is_loaded: AtomicBool,
+     swing_cooldown: AtomicU32,
+     // Position
+@@ -94,6 +118,10 @@ pub struct Client {
+ }
+ 
+ impl Client {
++    pub fn chunk_count(&self) -> u32 {
++        self.chunk_count.load(Ordering::Relaxed)
++    }
++
+     pub fn new(stream: TcpStream) -> Self {
+         let (connection_reader, connection_writer) = stream.into_split();
+         Self {
+@@ -114,6 +138,8 @@ impl Client {
+             close_interrupt: Arc::new(Notify::new()),
+             message_spam_cooldown: AtomicU32::new(1),
+             message_count: AtomicU32::new(0),
++            chunk_count: AtomicU32::new(0),
++            chunk_batch_count: AtomicU32::new(0),
+             is_loaded: AtomicBool::new(false),
+             rotation_cooldown: AtomicU32::new(0),
+             rotation_progress: AtomicCell::new(1.0),
+@@ -547,6 +573,20 @@ impl Client {
+ 
+                 self.send_packet(&SPlayerLoaded).await;
+             }
++            id if id == CChunkData::to_id(VERSION) => {
++                self.chunk_count.fetch_add(1, Ordering::Relaxed);
++            }
++            id if id == CChunkBatchEnd::to_id(VERSION) => {
++                let batches = self.chunk_batch_count.fetch_add(1, Ordering::Relaxed) + 1;
++                self.send_packet(&ChunkBatchAck {
++                    chunks_per_tick: 64.0,
++                })
++                .await;
++                log::debug!(
++                    "received chunk batch {batches}; total chunks={}",
++                    self.chunk_count.load(Ordering::Relaxed)
++                );
++            }
+             id if id == CPlayDisconnect::to_id(VERSION) => {
+                 log::error!("Kicking in Play State");
+                 self.close().await;
+diff --git a/src/main.rs b/src/main.rs
+index f1aca0a..2312a53 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -29,6 +29,10 @@ pub struct Args {
+     pub enable_rotation: bool,
+     #[arg(long, default_value_t = true)]
+     pub enable_swing: bool,
++    #[arg(long, default_value_t = false)]
++    pub exit_when_chunks_quiet: bool,
++    #[arg(long, default_value_t = 2000)]
++    pub chunk_quiet_ms: u64,
+ }
+ 
+ #[tokio::main]
+@@ -47,6 +51,7 @@ async fn main() {
+     let timeout_delay = Duration::from_millis(args.delay);
+ 
+     let mut join_handles = Vec::with_capacity(bot_count as usize);
++    let mut clients = Vec::with_capacity(bot_count as usize);
+     for i in 0..bot_count {
+         tokio::time::sleep(timeout_delay).await;
+         let stream_result = timeout(timeout_dur, TcpStream::connect(address)).await;
+@@ -68,6 +73,7 @@ async fn main() {
+             }
+         };
+         let client = Arc::new(Client::new(stream));
++        clients.push(Arc::clone(&client));
+ 
+         client.join_server(address, format!("BOT_{i}")).await;
+         let cloned_args = args.clone();
+@@ -88,8 +94,36 @@ async fn main() {
+         join_handles.push(join_handle);
+         log::info!("{}/{} Bots Joined", i + 1, bot_count);
+     }
+-    // Graceful shutdown on Ctrl+C
+-    tokio::signal::ctrl_c().await.unwrap();
++    if args.exit_when_chunks_quiet {
++        let load_started = std::time::Instant::now();
++        let mut last_counts = vec![0; clients.len()];
++        let mut last_change = std::time::Instant::now();
++        loop {
++            tokio::time::sleep(Duration::from_millis(100)).await;
++            let counts = clients
++                .iter()
++                .map(|client| client.chunk_count())
++                .collect::<Vec<_>>();
++            if counts != last_counts {
++                last_counts = counts;
++                last_change = std::time::Instant::now();
++            }
++            if !last_counts.is_empty()
++                && last_counts.iter().all(|count| *count > 0)
++                && last_change.elapsed() >= Duration::from_millis(args.chunk_quiet_ms)
++            {
++                log::info!(
++                    "BOTMARK_CHUNKS_COMPLETE elapsed_ms={} total_chunks={}",
++                    load_started.elapsed().as_millis(),
++                    last_counts.iter().sum::<u32>()
++                );
++                break;
++            }
++        }
++    } else {
++        // Graceful shutdown on Ctrl+C
++        tokio::signal::ctrl_c().await.unwrap();
++    }
+     log::info!("Shutting down...");
+ 
+     // Wait for all bot tasks to exit

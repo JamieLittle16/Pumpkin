@@ -121,6 +121,11 @@ indexmap.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+criterion = { workspace = true, features = ["html_reports", "async_tokio"] }
+
+[[bench]]
+name = "chunk_packet_cache"
+harness = false
 
 [features]
 console-subscriber = ["dep:console-subscriber"]
