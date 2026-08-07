@@ -64,6 +64,19 @@ impl WorldSpatialIndex {
             pose.alive = false;
             proxy.pose.publish(pose);
             self.total_entities.fetch_sub(1, Ordering::Relaxed);
+
+            let min_chunk_x = pose.exact_bounds.min.x.floor() as i32 >> 4;
+            let max_chunk_x = pose.exact_bounds.max.x.ceil() as i32 >> 4;
+            let min_chunk_z = pose.exact_bounds.min.z.floor() as i32 >> 4;
+            let max_chunk_z = pose.exact_bounds.max.z.ceil() as i32 >> 4;
+
+            for cx in min_chunk_x..=max_chunk_x {
+                for cz in min_chunk_z..=max_chunk_z {
+                    if let Some(chunk_idx) = self.chunks.get(&Vector2::new(cx, cz)) {
+                        chunk_idx.remove_key(key);
+                    }
+                }
+            }
         }
         self.registry.remove(key);
     }
@@ -103,6 +116,8 @@ impl WorldSpatialIndex {
                     .value()
                     .clone();
 
+                chunk_idx.add_key(key);
+
                 for sy in min_addr.section_y..=max_addr.section_y {
                     let sec = chunk_idx.get_or_create_section(sy);
 
@@ -115,7 +130,9 @@ impl WorldSpatialIndex {
         }
     }
 
-    /// Execute a candidates query against microcell grid storage.
+    pub const DIRECT_SCAN_THRESHOLD: u32 = 96;
+
+    /// Execute a candidates query with Adaptive Dispatcher (Local Scope Threshold <= 96).
     pub fn query_candidates(
         &self,
         world_id: u64,
@@ -123,16 +140,6 @@ impl WorldSpatialIndex {
         mask: SpatialCategory,
     ) -> Vec<Arc<dyn EntityBase>> {
         self.metrics.total_queries.fetch_add(1, Ordering::Relaxed);
-
-        // Low-N Fast Path (<= 16 total entities):
-        // 100% L1 cache-local direct scan without microcell lookup or DashMap shard locking.
-        if self.total_entities.load(Ordering::Relaxed) <= 16 {
-            let mut results = Vec::with_capacity(16);
-            self.registry.for_each_active(|entity| {
-                results.push(entity.clone());
-            });
-            return results;
-        }
 
         let min_addr = CellAddress::from_block_coords(
             bounds.min.x.floor() as i32,
@@ -144,6 +151,48 @@ impl WorldSpatialIndex {
             bounds.max.y.ceil() as i32,
             bounds.max.z.ceil() as i32,
         );
+
+        let mut touched_chunks = Vec::new();
+        let mut scope_entity_count = 0u32;
+
+        for cx in min_addr.chunk_pos.x..=max_addr.chunk_pos.x {
+            for cz in min_addr.chunk_pos.y..=max_addr.chunk_pos.y {
+                let chunk_pos = Vector2::new(cx, cz);
+                if let Some(chunk_idx) = self.chunks.get(&chunk_pos) {
+                    scope_entity_count += chunk_idx.entity_count.load(Ordering::Relaxed);
+                    touched_chunks.push(chunk_idx.clone());
+                }
+            }
+        }
+
+        // ADAPTIVE LOCAL SCOPE DISPATCH:
+        // If entity count in touched chunks <= DIRECT_SCAN_THRESHOLD (96),
+        // execute fast local direct scan over touched chunks' entity keys!
+        if scope_entity_count <= Self::DIRECT_SCAN_THRESHOLD {
+            let mut results = Vec::with_capacity(scope_entity_count as usize);
+            for chunk_idx in touched_chunks {
+                let keys = chunk_idx.active_keys.read().unwrap();
+                for &key in keys.iter() {
+                    let Some(proxy) = self.proxies.get(&key) else {
+                        continue;
+                    };
+                    let pose = proxy.pose.read();
+
+                    if !pose.alive || pose.world_id != world_id {
+                        continue;
+                    }
+                    if mask.bits() != 0 && (pose.categories.bits() & mask.bits()) == 0 {
+                        continue;
+                    }
+                    if pose.exact_bounds.intersects(bounds) {
+                        if let Some(entity) = self.registry.resolve(key) {
+                            results.push(entity);
+                        }
+                    }
+                }
+            }
+            return results;
+        }
 
         let mut candidate_keys = FxHashSet::default();
 

@@ -157,12 +157,30 @@ impl SectionSpatialIndex {
 #[derive(Default)]
 pub struct ChunkSpatialIndex {
     pub sections: RwLock<HashMap<i8, Arc<SectionSpatialIndex>>>,
+    pub active_keys: RwLock<Vec<EntityKey>>,
+    pub entity_count: AtomicU32,
     pub revision: AtomicU64,
 }
 
 impl ChunkSpatialIndex {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Register entity key into chunk active list.
+    pub fn add_key(&self, key: EntityKey) {
+        let mut keys = self.active_keys.write().unwrap();
+        keys.push(key);
+        self.entity_count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Unregister entity key from chunk active list.
+    pub fn remove_key(&self, key: EntityKey) {
+        let mut keys = self.active_keys.write().unwrap();
+        if let Some(pos) = keys.iter().position(|k| *k == key) {
+            keys.swap_remove(pos);
+            self.entity_count.fetch_sub(1, Ordering::Relaxed);
+        }
     }
 
     /// Retrieve or create a section spatial index.
