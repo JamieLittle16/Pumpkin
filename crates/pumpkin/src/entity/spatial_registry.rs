@@ -25,11 +25,23 @@ pub struct EntitySlot {
     pub entity: RwLock<Option<Arc<dyn EntityBase>>>,
 }
 
+use arc_swap::ArcSwap;
+
 /// Registry mapping generational `EntityKey` handles to active world entities.
-#[derive(Default)]
 pub struct EntitySpatialRegistry {
     slots: RwLock<Vec<EntitySlot>>,
     free: Mutex<Vec<u32>>,
+    pub active_flat: ArcSwap<Vec<Arc<dyn EntityBase>>>,
+}
+
+impl Default for EntitySpatialRegistry {
+    fn default() -> Self {
+        Self {
+            slots: RwLock::new(Vec::new()),
+            free: Mutex::new(Vec::new()),
+            active_flat: ArcSwap::new(Arc::new(Vec::new())),
+        }
+    }
 }
 
 impl EntitySpatialRegistry {
@@ -39,28 +51,37 @@ impl EntitySpatialRegistry {
 
     /// Allocate a generational key for a new entity.
     pub fn allocate(&self, entity: Arc<dyn EntityBase>) -> EntityKey {
-        let mut free = self.free.lock().unwrap();
-        if let Some(slot_idx) = free.pop() {
-            let slots = self.slots.read().unwrap();
-            let slot = &slots[slot_idx as usize];
-            let gen_val = slot.generation.load(Ordering::Relaxed);
-            *slot.entity.write().unwrap() = Some(entity);
-            EntityKey {
-                slot: slot_idx,
-                generation: gen_val,
+        let key = {
+            let mut free = self.free.lock().unwrap();
+            if let Some(slot_idx) = free.pop() {
+                let slots = self.slots.read().unwrap();
+                let slot = &slots[slot_idx as usize];
+                let gen_val = slot.generation.load(Ordering::Relaxed);
+                *slot.entity.write().unwrap() = Some(entity.clone());
+                EntityKey {
+                    slot: slot_idx,
+                    generation: gen_val,
+                }
+            } else {
+                let mut slots = self.slots.write().unwrap();
+                let slot_idx = slots.len() as u32;
+                slots.push(EntitySlot {
+                    generation: AtomicU32::new(1),
+                    entity: RwLock::new(Some(entity.clone())),
+                });
+                EntityKey {
+                    slot: slot_idx,
+                    generation: 1,
+                }
             }
-        } else {
-            let mut slots = self.slots.write().unwrap();
-            let slot_idx = slots.len() as u32;
-            slots.push(EntitySlot {
-                generation: AtomicU32::new(1),
-                entity: RwLock::new(Some(entity)),
-            });
-            EntityKey {
-                slot: slot_idx,
-                generation: 1,
-            }
-        }
+        };
+
+        // Lock-free atomic RCU update of active flat array
+        let mut active = (**self.active_flat.load()).clone();
+        active.push(entity);
+        self.active_flat.store(Arc::new(active));
+
+        key
     }
 
     /// Resolve an EntityKey to its entity reference, returning None if key is stale or removed.
@@ -76,13 +97,11 @@ impl EntitySpatialRegistry {
         slot.entity.read().unwrap().clone()
     }
 
-    /// Fast array scan over active entities (used for low-N fast path).
+    /// Lock-free array scan over active entities (used for low-N fast path).
     pub fn for_each_active<F: FnMut(&Arc<dyn EntityBase>)>(&self, mut f: F) {
-        let slots = self.slots.read().unwrap();
-        for slot in slots.iter() {
-            if let Some(ref entity) = *slot.entity.read().unwrap() {
-                f(entity);
-            }
+        let active = self.active_flat.load();
+        for entity in active.iter() {
+            f(entity);
         }
     }
 
@@ -91,19 +110,24 @@ impl EntitySpatialRegistry {
         if key.is_null() {
             return false;
         }
-        let slots = self.slots.read().unwrap();
-        let Some(slot) = slots.get(key.slot as usize) else {
-            return false;
-        };
-        if slot.generation.load(Ordering::Relaxed) != key.generation {
-            return false;
-        }
-
-        let mut entity_guard = slot.entity.write().unwrap();
-        if entity_guard.is_some() {
-            *entity_guard = None;
+        let removed_entity = {
+            let slots = self.slots.read().unwrap();
+            let Some(slot) = slots.get(key.slot as usize) else {
+                return false;
+            };
+            if slot.generation.load(Ordering::Relaxed) != key.generation {
+                return false;
+            }
             slot.generation.fetch_add(1, Ordering::Relaxed);
+            let entity = slot.entity.write().unwrap().take();
             self.free.lock().unwrap().push(key.slot);
+            entity
+        };
+
+        if let Some(entity) = removed_entity {
+            let mut active = (**self.active_flat.load()).clone();
+            active.retain(|e| !Arc::ptr_eq(e, &entity));
+            self.active_flat.store(Arc::new(active));
             true
         } else {
             false
