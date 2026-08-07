@@ -1,4 +1,5 @@
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
+use crossbeam::atomic::AtomicCell;
 use pumpkin_util::math::boundingbox::BoundingBox;
 use pumpkin_util::math::vector3::Vector3;
 use std::sync::Arc;
@@ -7,15 +8,25 @@ use pumpkin::entity::living::LivingEntity;
 use pumpkin::entity::spatial_metrics::SpatialMetrics;
 use pumpkin::entity::spatial_pose::SpatialCategory;
 use pumpkin::entity::world_spatial_index::WorldSpatialIndex;
-use pumpkin::entity::{EntityBase, NBTStorage};
+use pumpkin::entity::{Entity, EntityBase, NBTStorage};
 
-struct DummyEntity;
+struct BenchEntity {
+    bounds: AtomicCell<BoundingBox>,
+}
 
-impl NBTStorage for DummyEntity {}
+impl BenchEntity {
+    fn new(bounds: BoundingBox) -> Self {
+        Self {
+            bounds: AtomicCell::new(bounds),
+        }
+    }
+}
 
-impl EntityBase for DummyEntity {
-    fn get_entity(&self) -> &pumpkin::entity::Entity {
-        panic!("Dummy benchmark entity")
+impl NBTStorage for BenchEntity {}
+
+impl EntityBase for BenchEntity {
+    fn get_entity(&self) -> &Entity {
+        unreachable!("query_candidates uses AtomicSpatialPose bounds, get_entity is never called")
     }
 
     fn get_living_entity(&self) -> Option<&LivingEntity> {
@@ -34,14 +45,14 @@ impl EntityBase for DummyEntity {
 fn bench_spatial_queries(c: &mut Criterion) {
     let mut group = c.benchmark_group("spatial_index_vs_linear");
 
-    for size in [100, 1_000, 10_000] {
+    // Benchmark across Low-N (1, 5, 16) and High-N (100, 1,000, 10,000) entity counts
+    for size in [1, 5, 16, 100, 1_000, 10_000] {
         let metrics = Arc::new(SpatialMetrics::new());
         let index = Arc::new(WorldSpatialIndex::new(metrics));
 
-        let mut entities: Vec<Arc<dyn EntityBase>> = Vec::with_capacity(size);
+        let mut entities: Vec<Arc<BenchEntity>> = Vec::with_capacity(size);
 
         for i in 0..size {
-            let entity: Arc<dyn EntityBase> = Arc::new(DummyEntity);
             let x = (i % 100) as f64 * 10.0;
             let y = 64.0;
             let z = (i / 100) as f64 * 10.0;
@@ -50,8 +61,9 @@ fn bench_spatial_queries(c: &mut Criterion) {
                 Vector3::new(x, y, z),
                 Vector3::new(x + 1.0, y + 1.8, z + 1.0),
             );
-            index.register_entity(1, entity.clone(), bounds, SpatialCategory::LIVING);
-            entities.push(entity);
+            let bench_ent = Arc::new(BenchEntity::new(bounds));
+            index.register_entity(1, bench_ent.clone(), bounds, SpatialCategory::LIVING);
+            entities.push(bench_ent);
         }
 
         let query_box = BoundingBox::new(
@@ -59,22 +71,23 @@ fn bench_spatial_queries(c: &mut Criterion) {
             Vector3::new(280.0, 70.0, 280.0),
         );
 
-        // Linear scan baseline: O(N) iteration over all entities
+        // Global linear scan baseline: iterate all N entities in world and evaluate AABB intersection
         group.bench_with_input(
             BenchmarkId::new("linear_scan_baseline", size),
             &size,
             |b, _| {
                 b.iter(|| {
-                    let candidates: Vec<&Arc<dyn EntityBase>> = entities
+                    let results: Vec<Arc<BenchEntity>> = entities
                         .iter()
-                        .filter(|_| true) // O(N) linear iteration
+                        .filter(|e| e.bounds.load().intersects(&query_box))
+                        .cloned()
                         .collect();
-                    candidates.len()
+                    results.len()
                 });
             },
         );
 
-        // WorldSpatialIndex query: O(k + log N) spatial grid lookup
+        // WorldSpatialIndex query (Low-N fast path <= 16; microcells > 16)
         group.bench_with_input(
             BenchmarkId::new("world_spatial_index", size),
             &size,

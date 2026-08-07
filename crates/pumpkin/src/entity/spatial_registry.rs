@@ -76,6 +76,16 @@ impl EntitySpatialRegistry {
         slot.entity.read().unwrap().clone()
     }
 
+    /// Fast array scan over active entities (used for low-N fast path).
+    pub fn for_each_active<F: FnMut(&Arc<dyn EntityBase>)>(&self, mut f: F) {
+        let slots = self.slots.read().unwrap();
+        for slot in slots.iter() {
+            if let Some(ref entity) = *slot.entity.read().unwrap() {
+                f(entity);
+            }
+        }
+    }
+
     /// Remove an entity by key, advancing generation and marking slot for reuse.
     pub fn remove(&self, key: EntityKey) -> bool {
         if key.is_null() {

@@ -6,8 +6,8 @@ use crate::entity::EntityBase;
 use dashmap::DashMap;
 use pumpkin_util::math::boundingbox::BoundingBox;
 use pumpkin_util::math::vector2::Vector2;
-use std::collections::HashSet;
-use std::sync::atomic::Ordering;
+use rustc_hash::FxHashSet;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 /// World Spatial Index Façade managing hierarchical chunk microcells and entity lookup.
@@ -15,6 +15,7 @@ pub struct WorldSpatialIndex {
     pub registry: EntitySpatialRegistry,
     pub chunks: Arc<DashMap<Vector2<i32>, Arc<ChunkSpatialIndex>>>,
     pub proxies: DashMap<EntityKey, Arc<SpatialProxy>>,
+    pub total_entities: AtomicUsize,
     pub metrics: Arc<SpatialMetrics>,
 }
 
@@ -24,6 +25,7 @@ impl WorldSpatialIndex {
             registry: EntitySpatialRegistry::new(),
             chunks: Arc::new(DashMap::new()),
             proxies: DashMap::new(),
+            total_entities: AtomicUsize::new(0),
             metrics,
         }
     }
@@ -49,18 +51,19 @@ impl WorldSpatialIndex {
 
         let proxy = Arc::new(SpatialProxy::new(key, pose));
         self.proxies.insert(key, proxy);
+        self.total_entities.fetch_add(1, Ordering::Relaxed);
 
-        self.insert_cell_memberships(key, coverage, 1, categories);
-
+        self.insert_cell_memberships(key, bounds, 1, categories);
         key
     }
 
-    /// Unregister a despawned or removed entity from the spatial index.
+    /// Unregister a despawned or dead entity.
     pub fn unregister_entity(&self, key: EntityKey) {
         if let Some((_, proxy)) = self.proxies.remove(&key) {
-            let mut current_pose = proxy.pose.read();
-            current_pose.alive = false;
-            proxy.pose.publish(current_pose);
+            let mut pose = proxy.pose.read();
+            pose.alive = false;
+            proxy.pose.publish(pose);
+            self.total_entities.fetch_sub(1, Ordering::Relaxed);
         }
         self.registry.remove(key);
     }
@@ -121,6 +124,16 @@ impl WorldSpatialIndex {
     ) -> Vec<Arc<dyn EntityBase>> {
         self.metrics.total_queries.fetch_add(1, Ordering::Relaxed);
 
+        // Low-N Fast Path (<= 16 total entities):
+        // 100% L1 cache-local direct scan without microcell lookup or DashMap shard locking.
+        if self.total_entities.load(Ordering::Relaxed) <= 16 {
+            let mut results = Vec::with_capacity(16);
+            self.registry.for_each_active(|entity| {
+                results.push(entity.clone());
+            });
+            return results;
+        }
+
         let min_addr = CellAddress::from_block_coords(
             bounds.min.x.floor() as i32,
             bounds.min.y.floor() as i32,
@@ -132,7 +145,7 @@ impl WorldSpatialIndex {
             bounds.max.z.ceil() as i32,
         );
 
-        let mut candidate_keys = HashSet::new();
+        let mut candidate_keys = FxHashSet::default();
 
         for cx in min_addr.chunk_pos.x..=max_addr.chunk_pos.x {
             for cz in min_addr.chunk_pos.y..=max_addr.chunk_pos.y {
@@ -170,7 +183,7 @@ impl WorldSpatialIndex {
             }
         }
 
-        let mut results = Vec::new();
+        let mut results = Vec::with_capacity(candidate_keys.len());
         for key in candidate_keys {
             let Some(proxy) = self.proxies.get(&key) else {
                 continue;
