@@ -2,8 +2,9 @@ use crate::entity::spatial_registry::EntityKey;
 use bitflags::bitflags;
 use pumpkin_util::math::boundingbox::BoundingBox;
 use pumpkin_util::math::vector3::Vector3;
+use pumpkin_util::math::vector2::Vector2;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-use std::sync::Mutex;
+use std::sync::{Mutex, RwLock};
 
 bitflags! {
     /// Spatial capability flags for entity filtering without dynamic dispatch.
@@ -181,6 +182,7 @@ pub struct SpatialProxy {
     pub key: EntityKey,
     pub update_lock: Mutex<()>,
     pub pose: AtomicSpatialPose,
+    pub touched_chunks: RwLock<Vec<Vector2<i32>>>,
 }
 
 impl SpatialProxy {
@@ -189,6 +191,7 @@ impl SpatialProxy {
             key,
             update_lock: Mutex::new(()),
             pose: AtomicSpatialPose::new(initial_pose),
+            touched_chunks: RwLock::new(Vec::with_capacity(4)),
         }
     }
 }

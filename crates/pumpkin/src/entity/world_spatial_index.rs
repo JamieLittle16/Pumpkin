@@ -65,16 +65,10 @@ impl WorldSpatialIndex {
             proxy.pose.publish(pose);
             self.total_entities.fetch_sub(1, Ordering::Relaxed);
 
-            let min_chunk_x = pose.exact_bounds.min.x.floor() as i32 >> 4;
-            let max_chunk_x = pose.exact_bounds.max.x.ceil() as i32 >> 4;
-            let min_chunk_z = pose.exact_bounds.min.z.floor() as i32 >> 4;
-            let max_chunk_z = pose.exact_bounds.max.z.ceil() as i32 >> 4;
-
-            for cx in min_chunk_x..=max_chunk_x {
-                for cz in min_chunk_z..=max_chunk_z {
-                    if let Some(chunk_idx) = self.chunks.get(&Vector2::new(cx, cz)) {
-                        chunk_idx.remove_key(key);
-                    }
+            let touched = proxy.touched_chunks.read().unwrap();
+            for &chunk_pos in touched.iter() {
+                if let Some(chunk_idx) = self.chunks.get(&chunk_pos) {
+                    chunk_idx.remove_key(key);
                 }
             }
         }
@@ -106,6 +100,19 @@ impl WorldSpatialIndex {
             categories,
         };
 
+        if let Some(proxy) = self.proxies.get(&key) {
+            let mut touched = proxy.touched_chunks.write().unwrap();
+            touched.clear();
+            for cx in min_addr.chunk_pos.x..=max_addr.chunk_pos.x {
+                for cz in min_addr.chunk_pos.y..=max_addr.chunk_pos.y {
+                    let chunk_pos = Vector2::new(cx, cz);
+                    if !touched.contains(&chunk_pos) {
+                        touched.push(chunk_pos);
+                    }
+                }
+            }
+        }
+
         for cx in min_addr.chunk_pos.x..=max_addr.chunk_pos.x {
             for cz in min_addr.chunk_pos.y..=max_addr.chunk_pos.y {
                 let chunk_pos = Vector2::new(cx, cz);
@@ -132,7 +139,7 @@ impl WorldSpatialIndex {
 
     pub const DIRECT_SCAN_THRESHOLD: u32 = 96;
 
-    /// Execute a candidates query with Adaptive Dispatcher (Local Scope Threshold <= 96).
+    /// Execute a candidates query with Selectivity-Aware Adaptive Dispatcher.
     pub fn query_candidates(
         &self,
         world_id: u64,
@@ -154,21 +161,34 @@ impl WorldSpatialIndex {
 
         let mut touched_chunks = Vec::new();
         let mut scope_entity_count = 0u32;
+        let mut estimated_candidates = 0u32;
 
         for cx in min_addr.chunk_pos.x..=max_addr.chunk_pos.x {
             for cz in min_addr.chunk_pos.y..=max_addr.chunk_pos.y {
                 let chunk_pos = Vector2::new(cx, cz);
                 if let Some(chunk_idx) = self.chunks.get(&chunk_pos) {
-                    scope_entity_count += chunk_idx.entity_count.load(Ordering::Relaxed);
+                    let cnt = chunk_idx.entity_count.load(Ordering::Relaxed);
+                    scope_entity_count += cnt;
                     touched_chunks.push(chunk_idx.clone());
+
+                    for sy in min_addr.section_y..=max_addr.section_y {
+                        let sections = chunk_idx.sections.read().unwrap();
+                        if let Some(sec) = sections.get(&sy) {
+                            if sec.occupancy.load(Ordering::Relaxed) != 0 {
+                                estimated_candidates += cnt.min(32);
+                            }
+                        }
+                    }
                 }
             }
         }
 
-        // ADAPTIVE LOCAL SCOPE DISPATCH:
-        // If entity count in touched chunks <= DIRECT_SCAN_THRESHOLD (96),
-        // execute fast local direct scan over touched chunks' entity keys!
-        if scope_entity_count <= Self::DIRECT_SCAN_THRESHOLD {
+        // SELECTIVITY-AWARE ADAPTIVE DISPATCH:
+        // 1. If scope_entity_count <= DIRECT_SCAN_THRESHOLD (96) -> direct scan
+        // 2. If query is unselective (estimated_candidates >= 70% of scope_entity_count) -> direct scan
+        if scope_entity_count <= Self::DIRECT_SCAN_THRESHOLD
+            || (scope_entity_count > 0 && estimated_candidates * 10 >= scope_entity_count * 7)
+        {
             let mut results = Vec::with_capacity(scope_entity_count as usize);
             for chunk_idx in touched_chunks {
                 let keys = chunk_idx.active_keys.read().unwrap();
