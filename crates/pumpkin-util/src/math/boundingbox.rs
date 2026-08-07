@@ -3,7 +3,7 @@ use crate::math::{vector2::Vector2, vector3::Axis};
 use super::{position::BlockPos, vector3::Vector3};
 
 /// Represents an axis-aligned bounding box in 3D space.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct BoundingBox {
     /// The minimum corner of the box.
     pub min: Vector3<f64>,

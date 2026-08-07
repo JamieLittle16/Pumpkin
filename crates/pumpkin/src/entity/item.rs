@@ -1,4 +1,5 @@
 use crate::entity::player::statistics::StatisticCategory;
+use crate::entity::spatial_metrics::{QueryCaller, QueryKind};
 use crate::{entity::EntityBaseFuture, server::Server};
 use core::f32;
 use pumpkin_data::data_component_impl::DamageResistantImpl;
@@ -127,17 +128,34 @@ impl ItemEntity {
     }
 
     async fn try_merge(&self) {
+        let start = std::time::Instant::now();
         let bounding_box = self.entity.bounding_box.load().expand(0.5, 0.0, 0.5);
 
         let world = self.entity.world.load();
-        let entities = world.entities.load();
-        let items = entities.iter().filter_map(|entity: &Arc<dyn EntityBase>| {
-            entity.clone().get_item_entity().filter(|item| {
-                item.entity.entity_id != self.entity.entity_id
-                    && !item.never_despawn.load(Ordering::Relaxed)
-                    && item.entity.bounding_box.load().intersects(&bounding_box)
+        let candidates = world.spatial_index.query_candidates(
+            1,
+            &bounding_box,
+            crate::entity::spatial_pose::SpatialCategory::ITEM,
+        );
+        let examined = candidates.len();
+        let items: Vec<_> = candidates
+            .into_iter()
+            .filter_map(|entity: Arc<dyn EntityBase>| {
+                entity.get_item_entity().filter(|item| {
+                    item.entity.entity_id != self.entity.entity_id
+                        && !item.never_despawn.load(Ordering::Relaxed)
+                        && item.entity.bounding_box.load().intersects(&bounding_box)
+                })
             })
-        });
+            .collect();
+
+        world.spatial_metrics.record_query(
+            QueryCaller::ItemMerge,
+            QueryKind::Aabb,
+            examined,
+            items.len(),
+            start.elapsed().as_nanos() as u64,
+        );
 
         for item in items {
             if item.can_merge().await {

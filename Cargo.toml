@@ -102,13 +102,17 @@ edition = "2024"
 rust-version = "1.95"
 license = "GPL-3.0"
 
+[profile.dev]
+debug = 0
+
 [profile.release]
 lto = true
 strip = "debuginfo"
 codegen-units = 1
 
 [profile.bench]
-debug = true
+debug = 0
+lto = false
 
 [profile.profiling]
 inherits = "release"
