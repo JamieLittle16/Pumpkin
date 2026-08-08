@@ -170,8 +170,10 @@ impl ChunkSpatialIndex {
     /// Register entity key into chunk active list.
     pub fn add_key(&self, key: EntityKey) {
         let mut keys = self.active_keys.write().unwrap();
-        keys.push(key);
-        self.entity_count.fetch_add(1, Ordering::Relaxed);
+        if !keys.contains(&key) {
+            keys.push(key);
+            self.entity_count.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     /// Unregister entity key from chunk active list.

@@ -159,6 +159,37 @@ impl WorldSpatialIndex {
             bounds.max.z.ceil() as i32,
         );
 
+        // SINGLE-CHUNK LEVEL 0 FAST PATH:
+        // If query touches only 1 chunk and that chunk has <= DIRECT_SCAN_THRESHOLD (96) entities,
+        // execute single-chunk direct scan without multi-chunk loops or hash map overhead!
+        if min_addr.chunk_pos == max_addr.chunk_pos {
+            if let Some(chunk_idx) = self.chunks.get(&min_addr.chunk_pos) {
+                let scope_count = chunk_idx.entity_count.load(Ordering::Relaxed);
+                if scope_count <= Self::DIRECT_SCAN_THRESHOLD {
+                    let mut results = Vec::with_capacity(scope_count as usize);
+                    let keys = chunk_idx.active_keys.read().unwrap();
+                    for &key in keys.iter() {
+                        let Some(proxy) = self.proxies.get(&key) else {
+                            continue;
+                        };
+                        let pose = proxy.pose.read();
+                        if !pose.alive || pose.world_id != world_id {
+                            continue;
+                        }
+                        if mask.bits() != 0 && (pose.categories.bits() & mask.bits()) == 0 {
+                            continue;
+                        }
+                        if pose.exact_bounds.intersects(bounds) {
+                            if let Some(entity) = self.registry.resolve(key) {
+                                results.push(entity);
+                            }
+                        }
+                    }
+                    return results;
+                }
+            }
+        }
+
         let mut touched_chunks = Vec::new();
         let mut scope_entity_count = 0u32;
         let mut estimated_candidates = 0u32;
@@ -190,9 +221,13 @@ impl WorldSpatialIndex {
             || (scope_entity_count > 0 && estimated_candidates * 10 >= scope_entity_count * 7)
         {
             let mut results = Vec::with_capacity(scope_entity_count as usize);
+            let mut seen_keys = FxHashSet::default();
             for chunk_idx in touched_chunks {
                 let keys = chunk_idx.active_keys.read().unwrap();
                 for &key in keys.iter() {
+                    if !seen_keys.insert(key) {
+                        continue;
+                    }
                     let Some(proxy) = self.proxies.get(&key) else {
                         continue;
                     };
@@ -277,7 +312,7 @@ impl WorldSpatialIndex {
         results
     }
 
-    /// Update entity spatial position/bounds with loose coverage bounds optimization (Commit 10).
+    /// Update entity spatial position/bounds with loose coverage bounds optimization.
     pub fn update_entity_movement(
         &self,
         key: EntityKey,
@@ -313,6 +348,15 @@ impl WorldSpatialIndex {
         proxy.pose.publish(current_pose);
 
         true
+    }
+
+    /// Update entity bounding box for size changes (slime growth, sneaking, mounting) without translation.
+    pub fn update_entity_bounds(
+        &self,
+        key: EntityKey,
+        new_bounds: BoundingBox,
+    ) -> bool {
+        self.update_entity_movement(key, new_bounds)
     }
 
     /// Same-world or cross-world teleport protocol (Commit 10).
@@ -423,6 +467,25 @@ mod tests {
 
         // Query World 2 at tp_bounds -> should return 1
         assert_eq!(index.query_candidates(2, &query_tp, SpatialCategory::LIVING).len(), 1);
+    }
+
+    #[test]
+    fn test_resize_without_translation_reindexes_membership() {
+        let metrics = Arc::new(SpatialMetrics::new());
+        let index = WorldSpatialIndex::new(metrics);
+
+        let entity: Arc<dyn EntityBase> = Arc::new(DummyEntity);
+        let small_bounds = BoundingBox::new(Vector3::new(5.0, 64.0, 5.0), Vector3::new(5.5, 65.0, 5.5));
+        let key = index.register_entity(1, entity.clone(), small_bounds, SpatialCategory::LIVING);
+
+        // Position stays (5.0, 64.0, 5.0), but bounds expand to cover adjacent blocks (5.0..25.0)
+        let expanded_bounds = BoundingBox::new(Vector3::new(5.0, 64.0, 5.0), Vector3::new(25.0, 70.0, 25.0));
+        assert!(index.update_entity_bounds(key, expanded_bounds));
+
+        // Query adjacent chunk (20.0, 65.0, 20.0) -> must find candidate
+        let adj_query = BoundingBox::new(Vector3::new(19.0, 64.0, 19.0), Vector3::new(22.0, 68.0, 22.0));
+        let results = index.query_candidates(1, &adj_query, SpatialCategory::LIVING);
+        assert_eq!(results.len(), 1, "Entity must be discoverable in newly covered chunks after bounds expansion");
     }
 
     #[test]
