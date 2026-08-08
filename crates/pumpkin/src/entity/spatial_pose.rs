@@ -4,7 +4,7 @@ use pumpkin_util::math::boundingbox::BoundingBox;
 use pumpkin_util::math::vector3::Vector3;
 use pumpkin_util::math::vector2::Vector2;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-use std::sync::{Mutex, RwLock};
+use std::sync::Mutex;
 
 bitflags! {
     /// Spatial capability flags for entity filtering without dynamic dispatch.
@@ -177,21 +177,25 @@ impl AtomicSpatialPose {
     }
 }
 
-/// Light proxy per indexed entity carrying spatial key and atomic pose.
+pub struct SpatialMutationState {
+    pub touched_chunks: Vec<Vector2<i32>>,
+}
+
+/// Light proxy per indexed entity carrying spatial key, writer mutation lock, and atomic pose.
 pub struct SpatialProxy {
     pub key: EntityKey,
-    pub update_lock: Mutex<()>,
+    pub mutation: Mutex<SpatialMutationState>,
     pub pose: AtomicSpatialPose,
-    pub touched_chunks: RwLock<Vec<Vector2<i32>>>,
 }
 
 impl SpatialProxy {
     pub fn new(key: EntityKey, initial_pose: SpatialPose) -> Self {
         Self {
             key,
-            update_lock: Mutex::new(()),
+            mutation: Mutex::new(SpatialMutationState {
+                touched_chunks: Vec::with_capacity(4),
+            }),
             pose: AtomicSpatialPose::new(initial_pose),
-            touched_chunks: RwLock::new(Vec::with_capacity(4)),
         }
     }
 }

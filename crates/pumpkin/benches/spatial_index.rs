@@ -7,7 +7,7 @@ use std::sync::Arc;
 use pumpkin::entity::living::LivingEntity;
 use pumpkin::entity::spatial_metrics::SpatialMetrics;
 use pumpkin::entity::spatial_pose::SpatialCategory;
-use pumpkin::entity::world_spatial_index::WorldSpatialIndex;
+use pumpkin::entity::world_spatial_index::{QueryScratch, WorldSpatialIndex};
 use pumpkin::entity::{Entity, EntityBase, NBTStorage};
 
 struct BenchEntity {
@@ -92,7 +92,7 @@ fn bench_spatial_queries_adaptive(c: &mut Criterion) {
             },
         );
 
-        // 2. ACTUAL Public query_candidates with Local Scope Adaptive Dispatcher enabled!
+        // 2. Public query_candidates (returning new Vec)
         group.bench_with_input(
             BenchmarkId::new("world_spatial_index_adaptive", size),
             &size,
@@ -100,6 +100,19 @@ fn bench_spatial_queries_adaptive(c: &mut Criterion) {
                 b.iter(|| {
                     let candidates = index.query_candidates(1, &query_box, SpatialCategory::LIVING);
                     candidates.len()
+                });
+            },
+        );
+
+        // 3. Caller-owned QueryScratch fast-path (0 allocations)
+        group.bench_with_input(
+            BenchmarkId::new("world_spatial_index_scratch", size),
+            &size,
+            |b, _| {
+                let mut scratch = QueryScratch::new();
+                b.iter(|| {
+                    index.query_candidates_into(1, &query_box, SpatialCategory::LIVING, &mut scratch);
+                    scratch.results.len()
                 });
             },
         );

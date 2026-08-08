@@ -1,6 +1,6 @@
 use crate::entity::spatial_grid::{CellAddress, ChunkSpatialIndex, SpatialEntry};
 use crate::entity::spatial_metrics::SpatialMetrics;
-use crate::entity::spatial_pose::{SpatialCategory, SpatialPose, SpatialProxy};
+use crate::entity::spatial_pose::{SpatialCategory, SpatialMutationState, SpatialPose, SpatialProxy};
 use crate::entity::spatial_registry::{EntityKey, EntitySpatialRegistry};
 use crate::entity::EntityBase;
 use dashmap::DashMap;
@@ -17,6 +17,32 @@ pub struct WorldSpatialIndex {
     pub proxies: DashMap<EntityKey, Arc<SpatialProxy>>,
     pub total_entities: AtomicUsize,
     pub metrics: Arc<SpatialMetrics>,
+}
+
+/// Pre-allocated caller-owned query buffer for 0-allocation spatial queries.
+pub struct QueryScratch {
+    pub results: Vec<Arc<dyn EntityBase>>,
+    pub seen_keys: FxHashSet<EntityKey>,
+}
+
+impl QueryScratch {
+    pub fn new() -> Self {
+        Self {
+            results: Vec::with_capacity(64),
+            seen_keys: FxHashSet::default(),
+        }
+    }
+
+    pub fn clear(&mut self) {
+        self.results.clear();
+        self.seen_keys.clear();
+    }
+}
+
+impl Default for QueryScratch {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl WorldSpatialIndex {
@@ -50,23 +76,24 @@ impl WorldSpatialIndex {
         };
 
         let proxy = Arc::new(SpatialProxy::new(key, pose));
-        self.proxies.insert(key, proxy);
+        self.proxies.insert(key, proxy.clone());
         self.total_entities.fetch_add(1, Ordering::Relaxed);
 
-        self.insert_cell_memberships(key, bounds, 1, categories);
+        let mut mutation = proxy.mutation.lock().unwrap();
+        self.insert_cell_memberships(key, bounds, 1, categories, &mut mutation);
         key
     }
 
     /// Unregister a despawned or dead entity.
     pub fn unregister_entity(&self, key: EntityKey) {
         if let Some((_, proxy)) = self.proxies.remove(&key) {
+            let guard = proxy.mutation.lock().unwrap();
             let mut pose = proxy.pose.read();
             pose.alive = false;
             proxy.pose.publish(pose);
             self.total_entities.fetch_sub(1, Ordering::Relaxed);
 
-            let touched = proxy.touched_chunks.read().unwrap();
-            for &chunk_pos in touched.iter() {
+            for &chunk_pos in guard.touched_chunks.iter() {
                 if let Some(chunk_idx) = self.chunks.get(&chunk_pos) {
                     chunk_idx.remove_key(key);
                 }
@@ -82,6 +109,7 @@ impl WorldSpatialIndex {
         bounds: BoundingBox,
         revision: u32,
         categories: SpatialCategory,
+        mutation: &mut SpatialMutationState,
     ) {
         let min_addr = CellAddress::from_block_coords(
             bounds.min.x.floor() as i32,
@@ -100,15 +128,12 @@ impl WorldSpatialIndex {
             categories,
         };
 
-        if let Some(proxy) = self.proxies.get(&key) {
-            let mut touched = proxy.touched_chunks.write().unwrap();
-            touched.clear();
-            for cx in min_addr.chunk_pos.x..=max_addr.chunk_pos.x {
-                for cz in min_addr.chunk_pos.y..=max_addr.chunk_pos.y {
-                    let chunk_pos = Vector2::new(cx, cz);
-                    if !touched.contains(&chunk_pos) {
-                        touched.push(chunk_pos);
-                    }
+        mutation.touched_chunks.clear();
+        for cx in min_addr.chunk_pos.x..=max_addr.chunk_pos.x {
+            for cz in min_addr.chunk_pos.y..=max_addr.chunk_pos.y {
+                let chunk_pos = Vector2::new(cx, cz);
+                if !mutation.touched_chunks.contains(&chunk_pos) {
+                    mutation.touched_chunks.push(chunk_pos);
                 }
             }
         }
@@ -139,14 +164,16 @@ impl WorldSpatialIndex {
 
     pub const DIRECT_SCAN_THRESHOLD: u32 = 96;
 
-    /// Execute a candidates query with Selectivity-Aware Adaptive Dispatcher.
-    pub fn query_candidates(
+    /// Execute a candidates query using a caller-owned QueryScratch buffer (0 heap allocations).
+    pub fn query_candidates_into(
         &self,
         world_id: u64,
         bounds: &BoundingBox,
         mask: SpatialCategory,
-    ) -> Vec<Arc<dyn EntityBase>> {
+        scratch: &mut QueryScratch,
+    ) {
         self.metrics.total_queries.fetch_add(1, Ordering::Relaxed);
+        scratch.clear();
 
         let min_addr = CellAddress::from_block_coords(
             bounds.min.x.floor() as i32,
@@ -160,13 +187,10 @@ impl WorldSpatialIndex {
         );
 
         // SINGLE-CHUNK LEVEL 0 FAST PATH:
-        // If query touches only 1 chunk and that chunk has <= DIRECT_SCAN_THRESHOLD (96) entities,
-        // execute single-chunk direct scan without multi-chunk loops or hash map overhead!
         if min_addr.chunk_pos == max_addr.chunk_pos {
             if let Some(chunk_idx) = self.chunks.get(&min_addr.chunk_pos) {
                 let scope_count = chunk_idx.entity_count.load(Ordering::Relaxed);
                 if scope_count <= Self::DIRECT_SCAN_THRESHOLD {
-                    let mut results = Vec::with_capacity(scope_count as usize);
                     let keys = chunk_idx.active_keys.read().unwrap();
                     for &key in keys.iter() {
                         let Some(proxy) = self.proxies.get(&key) else {
@@ -181,11 +205,11 @@ impl WorldSpatialIndex {
                         }
                         if pose.exact_bounds.intersects(bounds) {
                             if let Some(entity) = self.registry.resolve(key) {
-                                results.push(entity);
+                                scratch.results.push(entity);
                             }
                         }
                     }
-                    return results;
+                    return;
                 }
             }
         }
@@ -215,17 +239,13 @@ impl WorldSpatialIndex {
         }
 
         // SELECTIVITY-AWARE ADAPTIVE DISPATCH:
-        // 1. If scope_entity_count <= DIRECT_SCAN_THRESHOLD (96) -> direct scan
-        // 2. If query is unselective (estimated_candidates >= 70% of scope_entity_count) -> direct scan
         if scope_entity_count <= Self::DIRECT_SCAN_THRESHOLD
             || (scope_entity_count > 0 && estimated_candidates * 10 >= scope_entity_count * 7)
         {
-            let mut results = Vec::with_capacity(scope_entity_count as usize);
-            let mut seen_keys = FxHashSet::default();
             for chunk_idx in touched_chunks {
                 let keys = chunk_idx.active_keys.read().unwrap();
                 for &key in keys.iter() {
-                    if !seen_keys.insert(key) {
+                    if !scratch.seen_keys.insert(key) {
                         continue;
                     }
                     let Some(proxy) = self.proxies.get(&key) else {
@@ -241,15 +261,13 @@ impl WorldSpatialIndex {
                     }
                     if pose.exact_bounds.intersects(bounds) {
                         if let Some(entity) = self.registry.resolve(key) {
-                            results.push(entity);
+                            scratch.results.push(entity);
                         }
                     }
                 }
             }
-            return results;
+            return;
         }
-
-        let mut candidate_keys = FxHashSet::default();
 
         for cx in min_addr.chunk_pos.x..=max_addr.chunk_pos.x {
             for cz in min_addr.chunk_pos.y..=max_addr.chunk_pos.y {
@@ -279,7 +297,7 @@ impl WorldSpatialIndex {
                         let entries = cell.entries.read().unwrap();
                         for entry in entries.iter() {
                             if mask.bits() == 0 || (entry.categories.bits() & mask.bits()) != 0 {
-                                candidate_keys.insert(entry.key);
+                                scratch.seen_keys.insert(entry.key);
                             }
                         }
                     }
@@ -287,8 +305,7 @@ impl WorldSpatialIndex {
             }
         }
 
-        let mut results = Vec::with_capacity(candidate_keys.len());
-        for key in candidate_keys {
+        for key in scratch.seen_keys.drain() {
             let Some(proxy) = self.proxies.get(&key) else {
                 continue;
             };
@@ -304,12 +321,22 @@ impl WorldSpatialIndex {
 
             if pose.exact_bounds.intersects(bounds) {
                 if let Some(entity) = self.registry.resolve(key) {
-                    results.push(entity);
+                    scratch.results.push(entity);
                 }
             }
         }
+    }
 
-        results
+    /// Execute a candidates query returning a new heap-allocated Vec.
+    pub fn query_candidates(
+        &self,
+        world_id: u64,
+        bounds: &BoundingBox,
+        mask: SpatialCategory,
+    ) -> Vec<Arc<dyn EntityBase>> {
+        let mut scratch = QueryScratch::new();
+        self.query_candidates_into(world_id, bounds, mask, &mut scratch);
+        scratch.results
     }
 
     /// Update entity spatial position/bounds with loose coverage bounds optimization.
@@ -322,7 +349,7 @@ impl WorldSpatialIndex {
             return false;
         };
 
-        let _guard = proxy.update_lock.lock().unwrap();
+        let mut mutation = proxy.mutation.lock().unwrap();
 
         let mut current_pose = proxy.pose.read();
         if !current_pose.alive {
@@ -341,7 +368,7 @@ impl WorldSpatialIndex {
         let new_coverage = SpatialPose::compute_coverage_bounds(new_bounds, 0.5);
         let new_rev = current_pose.membership_revision + 1;
 
-        self.insert_cell_memberships(key, new_coverage, new_rev, current_pose.categories);
+        self.insert_cell_memberships(key, new_coverage, new_rev, current_pose.categories, &mut mutation);
 
         current_pose.coverage_bounds = new_coverage;
         current_pose.membership_revision = new_rev;
@@ -370,13 +397,13 @@ impl WorldSpatialIndex {
             return false;
         };
 
-        let _guard = proxy.update_lock.lock().unwrap();
+        let mut mutation = proxy.mutation.lock().unwrap();
 
         let mut current_pose = proxy.pose.read();
         let target_coverage = SpatialPose::compute_coverage_bounds(target_bounds, 0.0);
         let new_rev = current_pose.membership_revision + 1;
 
-        self.insert_cell_memberships(key, target_coverage, new_rev, current_pose.categories);
+        self.insert_cell_memberships(key, target_coverage, new_rev, current_pose.categories, &mut mutation);
 
         current_pose.world_id = target_world_id;
         current_pose.exact_bounds = target_bounds;
@@ -467,6 +494,25 @@ mod tests {
 
         // Query World 2 at tp_bounds -> should return 1
         assert_eq!(index.query_candidates(2, &query_tp, SpatialCategory::LIVING).len(), 1);
+    }
+
+    #[test]
+    fn test_single_chunk_fast_path_cross_chunk_entity() {
+        let metrics = Arc::new(SpatialMetrics::new());
+        let index = WorldSpatialIndex::new(metrics);
+
+        let entity: Arc<dyn EntityBase> = Arc::new(DummyEntity);
+        // Entity centered in Chunk (0, 0) at x = 15.0, but AABB extends into Chunk (1, 0) at x = 18.0
+        let cross_bounds = BoundingBox::new(Vector3::new(15.0, 64.0, 5.0), Vector3::new(18.0, 65.8, 8.0));
+        let _key = index.register_entity(1, entity, cross_bounds, SpatialCategory::LIVING);
+
+        // Query entirely inside Chunk (1, 0) (x = 16.0..20.0, z = 4.0..10.0)
+        let chunk1_query = BoundingBox::new(Vector3::new(16.0, 60.0, 4.0), Vector3::new(20.0, 70.0, 10.0));
+
+        let mut scratch = QueryScratch::new();
+        index.query_candidates_into(1, &chunk1_query, SpatialCategory::LIVING, &mut scratch);
+
+        assert_eq!(scratch.results.len(), 1, "Single-chunk fast path in Chunk (1,0) must find cross-chunk entity");
     }
 
     #[test]
