@@ -535,6 +535,34 @@ mod tests {
     }
 
     #[test]
+    fn test_category_change_updates_spatial_visibility() {
+        let metrics = Arc::new(SpatialMetrics::new());
+        let index = WorldSpatialIndex::new(metrics);
+
+        let entity: Arc<dyn EntityBase> = Arc::new(DummyEntity);
+        let bounds = BoundingBox::new(Vector3::new(10.0, 64.0, 10.0), Vector3::new(11.0, 65.8, 11.0));
+        let key = index.register_entity(1, entity, bounds, SpatialCategory::LIVING);
+
+        let query = BoundingBox::new(Vector3::new(9.0, 63.0, 9.0), Vector3::new(12.0, 66.0, 12.0));
+
+        // LIVING query matches
+        assert_eq!(index.query_candidates(1, &query, SpatialCategory::LIVING).len(), 1);
+
+        // ITEM query does not match
+        assert_eq!(index.query_candidates(1, &query, SpatialCategory::ITEM).len(), 0);
+
+        // Mutate category to ITEM
+        if let Some(proxy) = index.proxies.get(&key) {
+            let mut pose = proxy.pose.read();
+            pose.categories = SpatialCategory::ITEM;
+            proxy.pose.publish(pose);
+        }
+
+        // ITEM query now matches
+        assert_eq!(index.query_candidates(1, &query, SpatialCategory::ITEM).len(), 1);
+    }
+
+    #[test]
     fn test_shadow_index_equivalence_against_oracle_trace() {
         use crate::entity::spatial_oracle::{OracleEntityKey, OracleEntityState, SpatialQueryOracle};
 
