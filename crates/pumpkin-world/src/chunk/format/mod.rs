@@ -381,7 +381,14 @@ impl ChunkData {
             dirty: AtomicBool::new(false),
             block_ticks: ChunkTickScheduler::from_iter(block_ticks),
             fluid_ticks: ChunkTickScheduler::from_iter(fluid_ticks),
-            pending_block_entities: std::sync::Mutex::new(block_entities),
+            block_entities: std::sync::Mutex::new(
+                block_entities
+                    .into_iter()
+                    .map(|(position, nbt)| {
+                        (position, crate::chunk::CanonicalBlockEntityNbt::new(nbt))
+                    })
+                    .collect(),
+            ),
             light_engine: std::sync::Mutex::new(light_engine),
             light_populated: AtomicBool::new(light_correct),
             status,
@@ -406,8 +413,11 @@ impl ChunkData {
             .load(std::sync::atomic::Ordering::Relaxed);
 
         let block_entities_nbt = {
-            let entities_guard = self.pending_block_entities.lock().unwrap();
-            entities_guard.values().cloned().collect::<Vec<_>>()
+            let entities_guard = self.block_entities.lock().unwrap();
+            entities_guard
+                .values()
+                .map(|record| record.persistence.clone())
+                .collect::<Vec<_>>()
         };
 
         let light_lock = self.light_engine.lock().unwrap();

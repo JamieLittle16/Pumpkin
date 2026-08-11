@@ -213,25 +213,18 @@ impl ClientPacket for CChunkData<'_> {
 
         let block_entities = self
             .0
-            .pending_block_entities
+            .block_entities
             .lock()
             .map_err(|_| WritingError::Message("block_entities lock poisoned".into()))?;
         write.write_var_int(&VarInt(block_entities.len() as i32))?;
-        for (pos, nbt) in block_entities.iter() {
+        for (pos, record) in block_entities.iter() {
+            let nbt = &record.initial_chunk;
             let local_xz = ((get_local_cord(pos.0.x) & 0xF) << 4) | (get_local_cord(pos.0.z) & 0xF);
 
             write.write_u8(local_xz as u8)?;
             write.write_i16_be(pos.0.y as i16)?;
 
-            let id = nbt.get_string("id").map_or(0, |id_str| {
-                let name = id_str.split(':').next_back().unwrap_or(id_str);
-                pumpkin_data::block_properties::BLOCK_ENTITY_TYPES
-                    .iter()
-                    .position(|&n| n == name)
-                    .unwrap_or(0)
-            });
-
-            write.write_var_int(&VarInt(id as i32))?;
+            write.write_var_int(&VarInt(record.block_entity_type.0 as i32))?;
 
             let mut client_nbt = nbt.clone();
             client_nbt.child_tags.remove("id");

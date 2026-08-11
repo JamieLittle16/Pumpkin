@@ -11,8 +11,7 @@ use pumpkin_util::math::position::BlockPos;
 use rustc_hash::FxHashMap;
 
 use std::sync::RwLock;
-use std::sync::atomic::AtomicBool;
-use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use thiserror::Error;
 use tokio::sync::Mutex;
 
@@ -25,6 +24,116 @@ pub const CHUNK_WIDTH: usize = BlockPalette::SIZE;
 pub const CHUNK_AREA: usize = CHUNK_WIDTH * CHUNK_WIDTH;
 pub const BIOME_VOLUME: usize = BiomePalette::VOLUME;
 pub const SUBCHUNK_VOLUME: usize = CHUNK_AREA * CHUNK_WIDTH;
+
+static NEXT_BLOCK_ENTITY_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct BlockEntityType(pub u32);
+
+impl BlockEntityType {
+    #[must_use]
+    pub fn from_nbt(nbt: &NbtCompound) -> Self {
+        let index = nbt
+            .get_string("id")
+            .and_then(|id| {
+                let name = id.split(':').next_back().unwrap_or(id);
+                pumpkin_data::block_properties::BLOCK_ENTITY_TYPES
+                    .iter()
+                    .position(|candidate| *candidate == name)
+            })
+            .unwrap_or(0);
+        Self(index as u32)
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct CanonicalBlockEntityNbt {
+    pub instance_id: u64,
+    pub block_entity_type: BlockEntityType,
+    pub persistence: NbtCompound,
+    pub initial_chunk: NbtCompound,
+    pub update: Option<NbtCompound>,
+    pub mutation_generation: u64,
+    pub persisted_generation: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CanonicalCommitResult {
+    Committed,
+    Superseded,
+    EntityReplaced,
+}
+
+impl CanonicalCommitResult {
+    #[must_use]
+    pub const fn is_committed(self) -> bool {
+        matches!(self, Self::Committed)
+    }
+}
+
+impl CanonicalBlockEntityNbt {
+    #[must_use]
+    pub fn new(persistence: NbtCompound) -> Self {
+        let block_entity_type = BlockEntityType::from_nbt(&persistence);
+        let instance_id = NEXT_BLOCK_ENTITY_INSTANCE_ID
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                current.checked_add(1)
+            })
+            .expect("block entity instance ID space exhausted");
+        Self {
+            instance_id,
+            block_entity_type,
+            initial_chunk: persistence.clone(),
+            update: Some(persistence.clone()),
+            persistence,
+            mutation_generation: 0,
+            persisted_generation: 0,
+        }
+    }
+
+    pub const fn begin_mutation(&mut self) -> u64 {
+        self.mutation_generation = self
+            .mutation_generation
+            .checked_add(1)
+            .expect("block entity mutation generation exhausted");
+        self.mutation_generation
+    }
+
+    pub fn commit_packet_state(
+        &mut self,
+        instance_id: u64,
+        generation: u64,
+        initial_chunk: NbtCompound,
+        update: Option<NbtCompound>,
+    ) -> CanonicalCommitResult {
+        if self.instance_id != instance_id {
+            return CanonicalCommitResult::EntityReplaced;
+        }
+        if self.mutation_generation != generation {
+            return CanonicalCommitResult::Superseded;
+        }
+        self.initial_chunk = initial_chunk;
+        self.update = update;
+        CanonicalCommitResult::Committed
+    }
+
+    pub fn commit_persistence(
+        &mut self,
+        instance_id: u64,
+        generation: u64,
+        persistence: NbtCompound,
+    ) -> CanonicalCommitResult {
+        if self.instance_id != instance_id {
+            return CanonicalCommitResult::EntityReplaced;
+        }
+        if self.mutation_generation != generation {
+            return CanonicalCommitResult::Superseded;
+        }
+        self.persistence = persistence;
+        self.persisted_generation = generation;
+        CanonicalCommitResult::Committed
+    }
+}
 
 #[derive(Error, Debug)]
 pub enum ChunkReadingError {
@@ -75,7 +184,7 @@ pub struct ChunkData {
     pub z: i32,
     pub block_ticks: ChunkTickScheduler<&'static Block>,
     pub fluid_ticks: ChunkTickScheduler<&'static Fluid>,
-    pub pending_block_entities: std::sync::Mutex<FxHashMap<BlockPos, NbtCompound>>,
+    pub block_entities: std::sync::Mutex<FxHashMap<BlockPos, CanonicalBlockEntityNbt>>,
     pub light_engine: std::sync::Mutex<ChunkLight>,
     pub light_populated: AtomicBool,
     pub status: ChunkStatus,
@@ -764,6 +873,28 @@ impl ChunkData {
             .find(|(_, sub)| !sub.has_only_air())
             .map_or(0, |(idx, _)| idx)
     }
+
+    /// Creates an empty in-memory `ChunkData` for the given column with no
+    /// sections, block entities, or lighting. Useful for tests and for
+    /// runtime-instantiated chunks that are populated before use.
+    #[must_use]
+    pub fn empty_chunk(x: i32, z: i32) -> Self {
+        Self {
+            section: ChunkSections::new(1, 0),
+            heightmap: std::sync::Mutex::new(ChunkHeightmaps::default()),
+            x,
+            z,
+            block_ticks: ChunkTickScheduler::default(),
+            fluid_ticks: ChunkTickScheduler::default(),
+            block_entities: std::sync::Mutex::default(),
+            light_engine: std::sync::Mutex::new(ChunkLight::default()),
+            light_populated: AtomicBool::new(false),
+            status: pumpkin_data::chunk::ChunkStatus::Empty,
+            blending_data: None,
+            dirty: AtomicBool::new(false),
+            inhabited_time: AtomicU64::new(0),
+        }
+    }
 }
 
 #[derive(Error, Debug)]
@@ -784,9 +915,53 @@ pub enum ChunkSerializingError {
 
 #[cfg(test)]
 mod tests {
-    use super::ChunkSections;
+    use super::{CanonicalBlockEntityNbt, CanonicalCommitResult, ChunkSections};
     use crate::chunk::palette::BlockPalette;
     use pumpkin_data::{Block, block_properties::has_random_ticks};
+    use pumpkin_nbt::compound::NbtCompound;
+
+    fn block_entity_nbt(value: i32) -> NbtCompound {
+        let mut nbt = NbtCompound::new();
+        nbt.put_string("id", "minecraft:furnace".to_owned());
+        nbt.put_int("value", value);
+        nbt
+    }
+
+    #[test]
+    fn canonical_block_entity_rejects_superseded_capture() {
+        let mut record = CanonicalBlockEntityNbt::new(block_entity_nbt(0));
+        let instance_id = record.instance_id;
+        let old_generation = record.begin_mutation();
+        let current_generation = record.begin_mutation();
+
+        assert_eq!(
+            record.commit_persistence(instance_id, old_generation, block_entity_nbt(1)),
+            CanonicalCommitResult::Superseded
+        );
+        assert_eq!(
+            record.commit_persistence(instance_id, current_generation, block_entity_nbt(2)),
+            CanonicalCommitResult::Committed
+        );
+        assert_eq!(record.persistence.get_int("value"), Some(2));
+    }
+
+    #[test]
+    fn canonical_block_entity_rejects_replaced_instance() {
+        let mut first = CanonicalBlockEntityNbt::new(block_entity_nbt(0));
+        let captured_instance = first.instance_id;
+        let captured_generation = first.begin_mutation();
+        let mut replacement = CanonicalBlockEntityNbt::new(block_entity_nbt(1));
+
+        assert_eq!(
+            replacement.commit_persistence(
+                captured_instance,
+                captured_generation,
+                block_entity_nbt(2)
+            ),
+            CanonicalCommitResult::EntityReplaced
+        );
+        assert_eq!(replacement.persistence.get_int("value"), Some(1));
+    }
 
     #[test]
     fn random_tick_cache_initializes_from_palette_contents() {

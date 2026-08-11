@@ -1,4 +1,4 @@
-use crate::block::entities::{BlockEntity, block_entity_from_nbt};
+use crate::block::entities::{BlockEntity, BlockEntityPacketNbt, block_entity_from_nbt};
 use dashmap::DashMap;
 use pumpkin_data::attributes::Attributes;
 use pumpkin_data::chunk::Biome;
@@ -10,6 +10,7 @@ use pumpkin_protocol::bedrock::network_item::{
     ContainerName, FullContainerName, NetworkItemDescriptor, NetworkItemStackDescriptor,
 };
 use pumpkin_protocol::codec::data_component::data_to_proto_sound;
+use pumpkin_world::chunk::CanonicalBlockEntityNbt;
 use pumpkin_world::generation::proto_chunk::GenerationCache;
 use std::sync::atomic::Ordering::Relaxed;
 use std::sync::{Arc, Weak};
@@ -180,6 +181,18 @@ impl PumpkinError for GetBlockError {
     }
 }
 
+/// A runtime block entity bound to the `instance_id` of the canonical record it
+/// was created from.
+///
+/// Persistence and update paths capture the expected `instance_id` together
+/// with the `Arc` at collection time, so they can later reject committing the
+/// NBT of an entity that was meanwhile removed and replaced by another entity at
+/// the same position.
+pub struct RuntimeBlockEntityEntry {
+    pub instance_id: u64,
+    pub entity: Arc<dyn BlockEntity>,
+}
+
 /// Represents a Minecraft world, containing entities, players, and the underlying level data.
 ///
 /// Each dimension (Overworld, Nether, End) typically has its own `World`.
@@ -227,7 +240,12 @@ pub struct World {
     pub forced_chunks: std::sync::Mutex<FxHashSet<Vector2<i32>>>,
     /// Block entities indexed by chunk, so ticking only visits the currently
     /// active chunks instead of scanning every loaded block entity each tick.
-    pub block_entities: DashMap<Vector2<i32>, FxHashMap<BlockPos, Arc<dyn BlockEntity>>>,
+    ///
+    /// Each entry pairs the runtime `Arc` with the `instance_id` of the
+    /// canonical record it was created from. Persistence and update paths use
+    /// this retained association so a stale runtime entity cannot mutate the
+    /// canonical record of a *replacement* entity occupying the same position.
+    pub block_entities: DashMap<Vector2<i32>, FxHashMap<BlockPos, RuntimeBlockEntityEntry>>,
 }
 
 impl PartialEq for World {
@@ -237,6 +255,11 @@ impl PartialEq for World {
 }
 
 impl Eq for World {}
+
+/// Max retries when capturing block-entity persistence against a continuously mutating record.
+/// If exceeded, the entity's dirty token is restored and its position reported so the caller can
+/// retry later or keep the runtime entity alive, rather than spinning forever or dropping state.
+const MAX_PERSIST_RETRIES: u32 = 8;
 
 impl World {
     pub async fn get_block_state_id_async(&self, position: &BlockPos) -> BlockStateId {
@@ -983,7 +1006,11 @@ impl World {
         let mut block_entities: Vec<Arc<dyn BlockEntity>> = Vec::new();
         for chunk_pos in active_chunks.iter() {
             if let Some(chunk_block_entities) = self.block_entities.get(chunk_pos) {
-                block_entities.extend(chunk_block_entities.values().cloned());
+                block_entities.extend(
+                    chunk_block_entities
+                        .values()
+                        .map(|entry| entry.entity.clone()),
+                );
             }
         }
         let block_entity_count = block_entities.len();
@@ -1152,6 +1179,7 @@ impl World {
             if self.level.autosave_ticks > 0 && self.level.save_enabled.load(Relaxed) {
                 let autosave = self.level.autosave_ticks as i64;
                 if autosave > 0 && level_time.world_age % autosave == 0 {
+                    self.persist_block_entities(None).await;
                     self.level.should_save.store(true, Relaxed);
                     self.level.level_channel.notify();
                 }
@@ -4295,6 +4323,7 @@ impl World {
         if chunks_set.is_empty() {
             return;
         }
+        let still_dirty = self.persist_block_entities(Some(&chunks_set)).await;
         let mut entities_to_remove = Vec::new();
 
         self.entities.rcu(|current_entities| {
@@ -4318,8 +4347,119 @@ impl World {
         }
 
         for chunk_pos in &chunks_set {
-            self.block_entities.remove(chunk_pos);
+            // Drop the chunk's runtime map, keeping only block entities whose capture
+            // did not complete (so their newer state is not lost to the disk save).
+            self.block_entities.alter(chunk_pos, |_, mut chunk_block_entities| {
+                chunk_block_entities.retain(|block_pos, _| still_dirty.contains(block_pos));
+                chunk_block_entities
+            });
+            self.block_entities
+                .remove_if(chunk_pos, |_, entities| entities.is_empty());
         }
+    }
+
+    /// Refreshes the chunk-owned persistence NBT before a save or unload boundary.
+    ///
+    /// Only entities whose dirty token was claimed ([`BlockEntity::take_dirty`])
+    /// are captured, so autosave serialises O(dirty) entities rather than every
+    /// loaded block entity. The token is claimed *before* capture: a mutation that
+    /// lands during the capture re-sets it, so the entity is captured again on a
+    /// later save rather than silently losing the newer state.
+    ///
+    /// A late result is committed only if both the block-entity instance and
+    /// mutation generation still match. A continuously-mutating entity is retried
+    /// at most `MAX_PERSIST_RETRIES` times; if it still cannot be captured its
+    /// position is returned so callers can keep the runtime entity alive instead
+    /// of spinning forever or dropping state.
+    #[expect(clippy::while_let_loop, clippy::needless_continue)]
+    async fn persist_block_entities(
+        &self,
+        chunks: Option<&FxHashSet<Vector2<i32>>>,
+    ) -> FxHashSet<BlockPos> {
+        let mut still_dirty = FxHashSet::default();
+        let entities: Vec<(u64, Arc<dyn BlockEntity>)> = self
+            .block_entities
+            .iter()
+            .filter(|entry| chunks.is_none_or(|chunks| chunks.contains(entry.key())))
+            .flat_map(|entry| {
+                entry
+                    .value()
+                    .values()
+                    .filter(|pair| pair.entity.take_dirty())
+                    .map(|pair| (pair.instance_id, pair.entity.clone()))
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+
+        for (expected_instance_id, entity) in entities {
+            let block_pos = entity.get_position();
+            let chunk_pos = block_pos.chunk_position();
+            let mut retries = 0;
+            loop {
+                // Capture the generation of the canonical record that still belongs to the
+                // expected instance. If the entity was removed and replaced at the same
+                // position, the record's instance no longer matches, so the stale runtime
+                // entity must not persist into the replacement.
+                let Some(generation) = self
+                    .level
+                    .read_chunk_sync(&chunk_pos, |chunk| {
+                        chunk
+                            .block_entities
+                            .lock()
+                            .unwrap()
+                            .get(&block_pos)
+                            .filter(|record| record.instance_id == expected_instance_id)
+                            .map(|record| record.mutation_generation)
+                    })
+                    .flatten()
+                else {
+                    break;
+                };
+
+                let mut persistence = NbtCompound::new();
+                entity.write_internal(&mut persistence).await;
+
+                let result = self
+                    .level
+                    .read_chunk_sync(&chunk_pos, |chunk| {
+                        let mut records = chunk.block_entities.lock().unwrap();
+                        // Re-check the expected instance before committing: a replacement may
+                        // have been captured between the generation read and this commit.
+                        let Some(record) = records.get_mut(&block_pos) else {
+                            return pumpkin_world::chunk::CanonicalCommitResult::EntityReplaced;
+                        };
+                        if record.instance_id != expected_instance_id {
+                            return pumpkin_world::chunk::CanonicalCommitResult::EntityReplaced;
+                        }
+                        record.commit_persistence(
+                            expected_instance_id,
+                            generation,
+                            persistence.clone(),
+                        )
+                    })
+                    .unwrap_or(pumpkin_world::chunk::CanonicalCommitResult::EntityReplaced);
+
+                match result {
+                    pumpkin_world::chunk::CanonicalCommitResult::Committed => {
+                        // The dirty token was already claimed before capture; do not clear it
+                        // again here, or a mutation that landed during the capture would be
+                        // dropped. A re-set token is captured again on the next save.
+                        break;
+                    }
+                    pumpkin_world::chunk::CanonicalCommitResult::Superseded => {
+                        retries += 1;
+                        if retries >= MAX_PERSIST_RETRIES {
+                            // Stop retrying. The position is recorded in still_dirty so unload paths
+                            // keep the runtime entity alive to retry on subsequent saves.
+                            still_dirty.insert(block_pos);
+                            break;
+                        }
+                    }
+                    pumpkin_world::chunk::CanonicalCommitResult::EntityReplaced => break,
+                }
+            }
+        }
+        still_dirty
     }
 
     pub async fn set_block_breaking(&self, from: &Entity, location: BlockPos, progress: i32) {
@@ -5102,37 +5242,43 @@ impl World {
     pub fn get_block_entity(&self, block_pos: &BlockPos) -> Option<Arc<dyn BlockEntity>> {
         let chunk_pos = block_pos.chunk_position();
         if let Some(chunk_block_entities) = self.block_entities.get(&chunk_pos)
-            && let Some(entity) = chunk_block_entities.get(block_pos)
+            && let Some(entry) = chunk_block_entities.get(block_pos)
         {
-            return Some(entity.clone());
+            return Some(entry.entity.clone());
         }
 
-        let nbt = self
+        let (instance_id, nbt) = self
             .level
             .read_chunk_sync(&chunk_pos, |chunk| {
                 chunk
-                    .pending_block_entities
+                    .block_entities
                     .lock()
                     .unwrap()
-                    .remove(block_pos)
+                    .get(block_pos)
+                    .map(|record| (record.instance_id, record.persistence.clone()))
             })
             .flatten()?;
         let entity = block_entity_from_nbt(&nbt)?;
-        self.block_entities
-            .entry(chunk_pos)
-            .or_default()
-            .insert(*block_pos, entity.clone());
+        self.block_entities.entry(chunk_pos).or_default().insert(
+            *block_pos,
+            RuntimeBlockEntityEntry {
+                instance_id,
+                entity: entity.clone(),
+            },
+        );
         Some(entity)
     }
 
     pub fn add_block_entity(&self, block_entity: Arc<dyn BlockEntity>) {
         let block_pos = block_entity.get_position();
         let chunk_pos = block_pos.chunk_position();
-        let block_entity_nbt = block_entity.chunk_data_nbt();
-        let entity_id = block_entity.resource_location().to_string();
+        let packet_nbt = block_entity.packet_nbt();
 
-        if let Some(nbt) = &block_entity_nbt {
-            let bytes = pumpkin_nbt::Nbt::from(nbt.clone()).write_unnamed();
+        if let Some(nbt) = packet_nbt
+            .as_ref()
+            .and_then(|packet| packet.update.as_ref())
+        {
+            let bytes = pumpkin_nbt::Nbt::from((*nbt).clone()).write_unnamed();
             self.broadcast_to_chunk(
                 chunk_pos,
                 &CBlockEntityData::new(
@@ -5143,33 +5289,33 @@ impl World {
             );
         }
 
-        self.block_entities
-            .entry(chunk_pos)
-            .or_default()
-            .insert(block_pos, block_entity);
-
-        if let Some(nbt) = block_entity_nbt {
-            let mut full_nbt = nbt;
-            full_nbt.put_string("id", entity_id);
-            full_nbt.put_int("x", block_pos.0.x);
-            full_nbt.put_int("y", block_pos.0.y);
-            full_nbt.put_int("z", block_pos.0.z);
-            self.add_block_entity_nbt(block_pos, &full_nbt);
-        }
-
+        let canonical = Self::canonical_block_entity_record(block_entity.as_ref(), packet_nbt);
+        let instance_id = canonical.instance_id;
         self.level.read_chunk_sync(&chunk_pos, |chunk| {
+            chunk
+                .block_entities
+                .lock()
+                .unwrap()
+                .insert(block_pos, canonical.clone());
             chunk.mark_dirty(true);
         });
+        self.block_entities.entry(chunk_pos).or_default().insert(
+            block_pos,
+            RuntimeBlockEntityEntry {
+                instance_id,
+                entity: block_entity,
+            },
+        );
     }
 
     pub(crate) fn add_block_entity_nbt(&self, block_pos: BlockPos, nbt: &NbtCompound) {
         self.level
             .read_chunk_sync(&block_pos.chunk_position(), |chunk| {
                 chunk
-                    .pending_block_entities
+                    .block_entities
                     .lock()
                     .unwrap()
-                    .insert(block_pos, nbt.clone());
+                    .insert(block_pos, CanonicalBlockEntityNbt::new(nbt.clone()));
                 chunk.mark_dirty(true);
             });
     }
@@ -5182,13 +5328,22 @@ impl World {
                 .is_some_and(|mut chunk_block_entities| {
                     chunk_block_entities.remove(block_pos).is_some()
                 });
+        self.level.read_chunk_sync(&chunk_pos, |chunk| {
+            let removed = chunk
+                .block_entities
+                .lock()
+                .unwrap()
+                .remove(block_pos)
+                .is_some();
+            if removed {
+                chunk.mark_dirty(true);
+            }
+            removed
+        });
         if removed {
             // Drop the chunk's map once its last block entity is gone.
             self.block_entities
                 .remove_if(&chunk_pos, |_, entities| entities.is_empty());
-            self.level.read_chunk_sync(&chunk_pos, |chunk| {
-                chunk.mark_dirty(true);
-            });
         }
     }
 
@@ -5197,7 +5352,7 @@ impl World {
             .level
             .read_chunk_sync(&chunk_pos, |chunk| {
                 chunk
-                    .pending_block_entities
+                    .block_entities
                     .lock()
                     .unwrap()
                     .keys()
@@ -5219,10 +5374,63 @@ impl World {
     pub fn update_block_entity(&self, block_entity: &Arc<dyn BlockEntity>) {
         let block_pos = block_entity.get_position();
         let chunk_pos = block_pos.chunk_position();
-        let block_entity_nbt = block_entity.chunk_data_nbt();
+        // Establish that the supplied runtime entity is the one bound to the
+        // canonical record occupying this position. If a replacement was
+        // inserted at `block_pos`, the runtime map now holds the replacement's
+        // `Arc`, so the supplied stale entity no longer matches and the update
+        // is rejected rather than mutating the replacement's record.
+        let Some(expected_instance_id) =
+            self.block_entities
+                .get(&chunk_pos)
+                .and_then(|chunk_block_entities| {
+                    chunk_block_entities
+                        .get(&block_pos)
+                        .filter(|entry| Arc::ptr_eq(&entry.entity, block_entity))
+                        .map(|entry| entry.instance_id)
+                })
+        else {
+            return;
+        };
+        let packet_nbt = block_entity.packet_nbt();
 
-        if let Some(nbt) = &block_entity_nbt {
-            let bytes = pumpkin_nbt::Nbt::from(nbt.clone()).write_unnamed();
+        let committed = self
+            .level
+            .read_chunk_sync(&chunk_pos, |chunk| {
+                let mut records = chunk.block_entities.lock().unwrap();
+                let Some(record) = records.get_mut(&block_pos) else {
+                    return false;
+                };
+                if record.instance_id != expected_instance_id {
+                    return false;
+                }
+                let generation = record.begin_mutation();
+                let result = record.commit_packet_state(
+                    expected_instance_id,
+                    generation,
+                    packet_nbt
+                        .as_ref()
+                        .map_or_else(NbtCompound::new, |packet| packet.initial_chunk.clone()),
+                    packet_nbt.as_ref().and_then(|packet| packet.update.clone()),
+                );
+                if result.is_committed() {
+                    chunk.mark_dirty(true);
+                    true
+                } else {
+                    false
+                }
+            })
+            .unwrap_or(false);
+
+        // The canonical persistence NBT is deliberately left untouched here: it is
+        // refreshed only by the async capture path (`persist_block_entities`), which
+        // serialises the full entity state including private fields the packet
+        // representation does not carry.
+        if committed
+            && let Some(nbt) = packet_nbt
+                .as_ref()
+                .and_then(|packet| packet.update.as_ref())
+        {
+            let bytes = pumpkin_nbt::Nbt::from((*nbt).clone()).write_unnamed();
             self.broadcast_to_chunk(
                 chunk_pos,
                 &CBlockEntityData::new(
@@ -5231,17 +5439,34 @@ impl World {
                     bytes.as_ref().into(),
                 ),
             );
-            let mut full_nbt = nbt.clone();
-            full_nbt.put_string("id", block_entity.resource_location().to_string());
-            let pos = block_entity.get_position();
-            full_nbt.put_int("x", pos.0.x);
-            full_nbt.put_int("y", pos.0.y);
-            full_nbt.put_int("z", pos.0.z);
-            self.add_block_entity_nbt(block_pos, &full_nbt);
         }
-        self.level.read_chunk_sync(&chunk_pos, |chunk| {
-            chunk.mark_dirty(true);
-        });
+    }
+
+    fn canonical_block_entity_record(
+        block_entity: &dyn BlockEntity,
+        packet_nbt: Option<BlockEntityPacketNbt>,
+    ) -> CanonicalBlockEntityNbt {
+        let persistence = Self::persistence_baseline(block_entity, packet_nbt.as_ref());
+        let mut record = CanonicalBlockEntityNbt::new(persistence);
+        if let Some(packet) = packet_nbt {
+            record.initial_chunk = packet.initial_chunk;
+            record.update = packet.update;
+        }
+        record
+    }
+
+    fn persistence_baseline(
+        block_entity: &dyn BlockEntity,
+        packet_nbt: Option<&BlockEntityPacketNbt>,
+    ) -> NbtCompound {
+        let mut nbt =
+            packet_nbt.map_or_else(NbtCompound::new, |packet| packet.initial_chunk.clone());
+        let position = block_entity.get_position();
+        nbt.put_string("id", block_entity.resource_location().to_string());
+        nbt.put_int("x", position.0.x);
+        nbt.put_int("y", position.0.y);
+        nbt.put_int("z", position.0.z);
+        nbt
     }
 
     fn intersects_aabb_with_direction(
@@ -5643,5 +5868,799 @@ impl WorldPortalExt for WorldPortal {
                 world.spawn_entity(entity).await;
             }
         });
+    }
+}
+#[cfg(test)]
+mod block_entity_persistence_tests {
+    use super::*;
+    use crate::block::entities::test_block::TestBlockBlockEntity;
+    use arc_swap::ArcSwap;
+    use pumpkin_config::world::LevelConfig;
+    use pumpkin_data::dimension::Dimension;
+    use pumpkin_nbt::compound::NbtCompound;
+    use pumpkin_util::math::position::BlockPos;
+    use pumpkin_util::world_seed::Seed;
+    use pumpkin_world::chunk::{BlockEntityType, ChunkData};
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
+    use tempfile::TempDir;
+    use tokio::sync::Notify;
+
+    fn persistence(pos: BlockPos, marker: Option<i64>) -> NbtCompound {
+        let mut nbt = NbtCompound::new();
+        nbt.put_string("id", "minecraft:test_block".to_string());
+        nbt.put_int("x", pos.0.x);
+        nbt.put_int("y", pos.0.y);
+        nbt.put_int("z", pos.0.z);
+        if let Some(marker) = marker {
+            nbt.put_long("marker", marker);
+        }
+        nbt
+    }
+
+    fn record_at(
+        pos: BlockPos,
+        instance_id: u64,
+        marker: Option<i64>,
+        update: Option<NbtCompound>,
+    ) -> CanonicalBlockEntityNbt {
+        let persistence = persistence(pos, marker);
+        let block_entity_type = BlockEntityType::from_nbt(&persistence);
+        CanonicalBlockEntityNbt {
+            instance_id,
+            block_entity_type,
+            persistence,
+            initial_chunk: NbtCompound::new(),
+            update,
+            mutation_generation: 0,
+            persisted_generation: 0,
+        }
+    }
+
+    fn insert_record(world: &World, pos: BlockPos, record: &CanonicalBlockEntityNbt) {
+        world.level.read_chunk_sync(&pos.chunk_position(), |chunk| {
+            chunk
+                .block_entities
+                .lock()
+                .unwrap()
+                .insert(pos, record.clone());
+        });
+    }
+
+    fn insert_runtime(
+        world: &World,
+        pos: BlockPos,
+        instance_id: u64,
+        entity: Arc<dyn BlockEntity>,
+    ) {
+        world
+            .block_entities
+            .entry(pos.chunk_position())
+            .or_default()
+            .insert(
+                pos,
+                RuntimeBlockEntityEntry {
+                    instance_id,
+                    entity,
+                },
+            );
+    }
+
+    fn load_chunk(world: &World, pos: BlockPos) {
+        let chunk_pos = pos.chunk_position();
+        world.level.loaded_chunks.insert(
+            chunk_pos,
+            Arc::new(ChunkData::empty_chunk(chunk_pos.x, chunk_pos.y)),
+        );
+    }
+
+    fn build_world() -> (Arc<World>, TempDir) {
+        let temp_dir = TempDir::new().expect("create temp dir");
+        let level = Level::from_root_folder(
+            &LevelConfig::default(),
+            temp_dir.path().to_path_buf(),
+            0,
+            Dimension::OVERWORLD,
+            None,
+        );
+        let level_info = Arc::new(ArcSwap::new(Arc::new(LevelData::default(Seed(0)))));
+        let world = Arc::new(World::load(
+            level,
+            level_info,
+            Dimension::OVERWORLD,
+            crate::block::registry::default_registry(),
+            Weak::new(),
+        ));
+        (world, temp_dir)
+    }
+
+    /// A minimal runtime entity whose `packet_nbt` is distinguishable, so a
+    /// test can detect when a stale entity's packet state overwrites the
+    /// canonical record of a replacement entity at the same position.
+    struct MarkerBlockEntity {
+        position: BlockPos,
+        marker: u64,
+    }
+
+    impl MarkerBlockEntity {
+        const fn new(position: BlockPos, marker: u64) -> Self {
+            Self { position, marker }
+        }
+    }
+
+    impl BlockEntity for MarkerBlockEntity {
+        fn write_nbt<'a>(
+            &'a self,
+            nbt: &'a mut NbtCompound,
+        ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
+            Box::pin(async move {
+                nbt.put_long("marker", self.marker as i64);
+            })
+        }
+
+        fn from_nbt(_nbt: &NbtCompound, position: BlockPos) -> Self {
+            Self {
+                position,
+                marker: 0,
+            }
+        }
+
+        fn resource_location(&self) -> &'static str {
+            TestBlockBlockEntity::ID
+        }
+
+        fn get_position(&self) -> BlockPos {
+            self.position
+        }
+
+        fn packet_nbt(&self) -> Option<BlockEntityPacketNbt> {
+            let mut initial_chunk = NbtCompound::new();
+            initial_chunk.put_long("marker", self.marker as i64);
+            let mut update = NbtCompound::new();
+            update.put_long("marker", self.marker as i64);
+            Some(BlockEntityPacketNbt {
+                initial_chunk,
+                update: Some(update),
+            })
+        }
+
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    /// A runtime entity whose `write_internal` simulates a replacement being
+    /// captured between the persistence generation read and the commit: it
+    /// re-binds the canonical record to a different instance before persisting.
+    struct RaceBlockEntity {
+        position: BlockPos,
+        level: Option<Arc<Level>>,
+        replacement_instance: u64,
+        captured: Arc<Notify>,
+        release: Arc<Notify>,
+    }
+
+    impl RaceBlockEntity {
+        const fn new(
+            position: BlockPos,
+            level: Arc<Level>,
+            replacement_instance: u64,
+            captured: Arc<Notify>,
+            release: Arc<Notify>,
+        ) -> Self {
+            Self {
+                position,
+                level: Some(level),
+                replacement_instance,
+                captured,
+                release,
+            }
+        }
+    }
+
+    impl BlockEntity for RaceBlockEntity {
+        fn write_nbt<'a>(
+            &'a self,
+            nbt: &'a mut NbtCompound,
+        ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
+            Box::pin(async move {
+                nbt.put_long("marker", 99);
+            })
+        }
+
+        fn from_nbt(_nbt: &NbtCompound, position: BlockPos) -> Self {
+            Self {
+                position,
+                level: None,
+                replacement_instance: 0,
+                captured: Arc::new(Notify::new()),
+                release: Arc::new(Notify::new()),
+            }
+        }
+
+        fn resource_location(&self) -> &'static str {
+            TestBlockBlockEntity::ID
+        }
+
+        fn get_position(&self) -> BlockPos {
+            self.position
+        }
+
+        fn write_internal<'a>(
+            &'a self,
+            nbt: &'a mut NbtCompound,
+        ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
+            let level = self.level.clone().expect("level present in test entity");
+            let pos = self.position;
+            let replacement_instance = self.replacement_instance;
+            let captured = self.captured.clone();
+            let release = self.release.clone();
+            Box::pin(async move {
+                level.read_chunk_sync(&pos.chunk_position(), |chunk| {
+                    let mut records = chunk.block_entities.lock().unwrap();
+                    if let Some(record) = records.get_mut(&pos) {
+                        record.instance_id = replacement_instance;
+                    }
+                });
+                captured.notify_one();
+                release.notified().await;
+                nbt.put_string("id", "minecraft:test_block".to_string());
+                nbt.put_int("x", pos.0.x);
+                nbt.put_int("y", pos.0.y);
+                nbt.put_int("z", pos.0.z);
+                nbt.put_long("marker", 99);
+            })
+        }
+
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn stale_runtime_entity_cannot_persist_into_replacement() {
+        let (world, _temp_dir) = build_world();
+        let pos = BlockPos::new(0, 0, 0);
+        load_chunk(&world, pos);
+
+        // The canonical record at this position now belongs to a *replacement*
+        // entity (instance 200) whose persistence carries a marker.
+        insert_record(&world, pos, &record_at(pos, 200, Some(7), None));
+
+        // The runtime map still holds the stale association for the *old*
+        // entity (instance 100), which was never removed.
+        let stale = Arc::new(TestBlockBlockEntity::new(pos));
+        insert_runtime(&world, pos, 100, stale);
+
+        world.persist_block_entities(None).await;
+
+        // The replacement's persistence must be untouched.
+        let marker = world
+            .level
+            .read_chunk_sync(&pos.chunk_position(), |chunk| {
+                chunk
+                    .block_entities
+                    .lock()
+                    .unwrap()
+                    .get(&pos)
+                    .map(|record| record.persistence.get_long("marker"))
+            })
+            .flatten()
+            .flatten();
+        assert_eq!(marker, Some(7));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn stale_runtime_entity_cannot_update_replacement_packet_state() {
+        let (world, _temp_dir) = build_world();
+        let pos = BlockPos::new(0, 0, 0);
+        load_chunk(&world, pos);
+
+        // The replacement (instance 200) owns both the canonical record and the
+        // runtime slot, with packet state distinguishable by its marker.
+        let replacement = Arc::new(MarkerBlockEntity::new(pos, 2));
+        let packet_nbt = replacement.packet_nbt().unwrap();
+        let record = record_at(pos, 200, Some(2), packet_nbt.update);
+        insert_record(&world, pos, &record);
+        insert_runtime(&world, pos, 200, replacement);
+
+        // A *stale* runtime entity (different `Arc`, same position) tries to push
+        // its packet state onto the replacement's record.
+        let stale: Arc<dyn BlockEntity> = Arc::new(MarkerBlockEntity::new(pos, 1));
+        world.update_block_entity(&stale);
+
+        let update_marker = world
+            .level
+            .read_chunk_sync(&pos.chunk_position(), |chunk| {
+                chunk
+                    .block_entities
+                    .lock()
+                    .unwrap()
+                    .get(&pos)
+                    .and_then(|record| record.update.as_ref())
+                    .and_then(|update| update.get_long("marker"))
+            })
+            .flatten();
+        assert_eq!(update_marker, Some(2));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn replacement_during_persistence_capture_is_rejected() {
+        let (world, _temp_dir) = build_world();
+        let pos = BlockPos::new(0, 0, 0);
+        load_chunk(&world, pos);
+
+        let level = world.level.clone();
+        let captured = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let race = Arc::new(RaceBlockEntity::new(
+            pos,
+            level.clone(),
+            200,
+            captured.clone(),
+            release.clone(),
+        ));
+        insert_record(&world, pos, &record_at(pos, 100, Some(7), None));
+        insert_runtime(&world, pos, 100, race);
+
+        let persist_world = world.clone();
+        let handle = tokio::spawn(async move {
+            persist_world.persist_block_entities(None).await;
+        });
+
+        // Wait until `write_internal` has re-bound the canonical record to the
+        // replacement instance, then let persistence proceed to its commit step.
+        captured.notified().await;
+        release.notify_one();
+        handle.await.expect("persistence task must not panic");
+
+        // The stale entity's persistence must not have been committed into the
+        // replacement record.
+        let marker = world
+            .level
+            .read_chunk_sync(&pos.chunk_position(), |chunk| {
+                chunk
+                    .block_entities
+                    .lock()
+                    .unwrap()
+                    .get(&pos)
+                    .map(|record| record.persistence.get_long("marker"))
+            })
+            .flatten()
+            .flatten();
+        assert_eq!(marker, Some(7));
+    }
+
+    /// A dirty-tracked runtime entity whose persistence (`write_internal`) and
+    /// packet representations (`packet_nbt`) are independent: `secret` and
+    /// `captures` only ever appear in the persisted NBT, `marker` only in the
+    /// client-visible NBT.
+    struct DirtyTestBlockEntity {
+        position: BlockPos,
+        dirty: AtomicBool,
+        secret: AtomicI64,
+        packet_value: AtomicI64,
+        captures: AtomicUsize,
+    }
+
+    impl DirtyTestBlockEntity {
+        const fn new(position: BlockPos) -> Self {
+            Self {
+                position,
+                dirty: AtomicBool::new(false),
+                secret: AtomicI64::new(0),
+                packet_value: AtomicI64::new(0),
+                captures: AtomicUsize::new(0),
+            }
+        }
+
+        fn set_secret(&self, value: i64) {
+            self.secret.store(value, Ordering::Relaxed);
+            self.dirty.store(true, Ordering::Relaxed);
+        }
+
+        fn set_packet_value(&self, value: i64) {
+            self.packet_value.store(value, Ordering::Relaxed);
+        }
+
+        fn captures(&self) -> usize {
+            self.captures.load(Ordering::Relaxed)
+        }
+    }
+
+    impl BlockEntity for DirtyTestBlockEntity {
+        fn write_nbt<'a>(
+            &'a self,
+            _nbt: &'a mut NbtCompound,
+        ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
+            Box::pin(async {})
+        }
+
+        fn write_internal<'a>(
+            &'a self,
+            nbt: &'a mut NbtCompound,
+        ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
+            let captures = self.captures.fetch_add(1, Ordering::Relaxed) + 1;
+            let secret = self.secret.load(Ordering::Relaxed);
+            let position = self.position;
+            Box::pin(async move {
+                nbt.put_string("id", TestBlockBlockEntity::ID.to_string());
+                nbt.put_int("x", position.0.x);
+                nbt.put_int("y", position.0.y);
+                nbt.put_int("z", position.0.z);
+                nbt.put_long("secret", secret);
+                nbt.put_int("captures", captures as i32);
+            })
+        }
+
+        fn from_nbt(_nbt: &NbtCompound, position: BlockPos) -> Self
+        where
+            Self: Sized,
+        {
+            Self::new(position)
+        }
+
+        fn resource_location(&self) -> &'static str {
+            "minecraft:chest"
+        }
+
+        fn get_position(&self) -> BlockPos {
+            self.position
+        }
+
+        fn packet_nbt(&self) -> Option<BlockEntityPacketNbt> {
+            let mut nbt = NbtCompound::new();
+            nbt.put_long("marker", self.packet_value.load(Ordering::Relaxed));
+            Some(BlockEntityPacketNbt {
+                initial_chunk: nbt.clone(),
+                update: Some(nbt),
+            })
+        }
+
+        fn is_dirty(&self) -> bool {
+            self.dirty.load(Ordering::Relaxed)
+        }
+
+        fn clear_dirty(&self) {
+            self.dirty.store(false, Ordering::Relaxed);
+        }
+
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    /// A dirty-tracked runtime entity whose capture blocks until released, so a
+    /// test can run a mutation *during* the capture.
+    struct RaceDirtyBlockEntity {
+        position: BlockPos,
+        dirty: AtomicBool,
+        captured: Arc<Notify>,
+        release: Arc<Notify>,
+    }
+
+    impl RaceDirtyBlockEntity {
+        const fn new(position: BlockPos, captured: Arc<Notify>, release: Arc<Notify>) -> Self {
+            Self {
+                position,
+                dirty: AtomicBool::new(false),
+                captured,
+                release,
+            }
+        }
+    }
+
+    impl BlockEntity for RaceDirtyBlockEntity {
+        fn write_nbt<'a>(
+            &'a self,
+            _nbt: &'a mut NbtCompound,
+        ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
+            Box::pin(async {})
+        }
+
+        fn write_internal<'a>(
+            &'a self,
+            nbt: &'a mut NbtCompound,
+        ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
+            let captured = self.captured.clone();
+            let release = self.release.clone();
+            let position = self.position;
+            Box::pin(async move {
+                captured.notify_one();
+                release.notified().await;
+                nbt.put_string("id", TestBlockBlockEntity::ID.to_string());
+                nbt.put_int("x", position.0.x);
+                nbt.put_int("y", position.0.y);
+                nbt.put_int("z", position.0.z);
+                nbt.put_long("marker", 99);
+            })
+        }
+
+        fn from_nbt(_nbt: &NbtCompound, position: BlockPos) -> Self
+        where
+            Self: Sized,
+        {
+            Self::new(position, Arc::new(Notify::new()), Arc::new(Notify::new()))
+        }
+
+        fn resource_location(&self) -> &'static str {
+            TestBlockBlockEntity::ID
+        }
+
+        fn get_position(&self) -> BlockPos {
+            self.position
+        }
+
+        fn is_dirty(&self) -> bool {
+            self.dirty.load(Ordering::Relaxed)
+        }
+
+        fn clear_dirty(&self) {
+            self.dirty.store(false, Ordering::Relaxed);
+        }
+
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    /// A runtime entity whose capture re-bumps the canonical record's mutation
+    /// generation, so every persistence commit is superseded while it is being
+    /// persisted.
+    struct ChurnBlockEntity {
+        position: BlockPos,
+        level: Option<Arc<Level>>,
+    }
+
+    impl ChurnBlockEntity {
+        const fn new(position: BlockPos, level: Arc<Level>) -> Self {
+            Self {
+                position,
+                level: Some(level),
+            }
+        }
+    }
+
+    impl BlockEntity for ChurnBlockEntity {
+        fn write_nbt<'a>(
+            &'a self,
+            _nbt: &'a mut NbtCompound,
+        ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
+            Box::pin(async {})
+        }
+
+        fn write_internal<'a>(
+            &'a self,
+            nbt: &'a mut NbtCompound,
+        ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
+            let level = self.level.clone().expect("level present in test entity");
+            let position = self.position;
+            Box::pin(async move {
+                level.read_chunk_sync(&position.chunk_position(), |chunk| {
+                    if let Some(record) =
+                        chunk.block_entities.lock().unwrap().get_mut(&position)
+                    {
+                        record.begin_mutation();
+                    }
+                });
+                nbt.put_string("id", TestBlockBlockEntity::ID.to_string());
+                nbt.put_int("x", position.0.x);
+                nbt.put_int("y", position.0.y);
+                nbt.put_int("z", position.0.z);
+                nbt.put_long("marker", 99);
+            })
+        }
+
+        fn from_nbt(_nbt: &NbtCompound, position: BlockPos) -> Self
+        where
+            Self: Sized,
+        {
+            Self {
+                position,
+                level: None,
+            }
+        }
+
+        fn resource_location(&self) -> &'static str {
+            TestBlockBlockEntity::ID
+        }
+
+        fn get_position(&self) -> BlockPos {
+            self.position
+        }
+
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn same_instance_mutation_during_capture_is_not_cleared() {
+        let (world, _temp_dir) = build_world();
+        let pos = BlockPos::new(0, 0, 0);
+        load_chunk(&world, pos);
+
+        let captured = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let entity: Arc<dyn BlockEntity> = Arc::new(RaceDirtyBlockEntity::new(
+            pos,
+            captured.clone(),
+            release.clone(),
+        ));
+        let concrete = entity
+            .as_any()
+            .downcast_ref::<RaceDirtyBlockEntity>()
+            .expect("downcast to race entity");
+        concrete.dirty.store(true, Ordering::Relaxed);
+
+        insert_record(&world, pos, &record_at(pos, 100, Some(7), None));
+        insert_runtime(&world, pos, 100, entity.clone());
+
+        let persist_world = world.clone();
+        let handle = tokio::spawn(async move {
+            persist_world.persist_block_entities(None).await;
+        });
+
+        // Wait until the capture is in progress, then mutate during it.
+        captured.notified().await;
+        concrete.dirty.store(true, Ordering::Relaxed);
+        release.notify_one();
+        handle.await.expect("persistence task must not panic");
+
+        // The capture committed, but the mutation that landed during it re-set the
+        // dirty token: it must not have been cleared after capture, or the newer
+        // state would be silently lost.
+        assert!(
+            concrete.dirty.load(Ordering::Relaxed),
+            "mutation during capture must leave the dirty token set"
+        );
+        let marker = world
+            .level
+            .read_chunk_sync(&pos.chunk_position(), |chunk| {
+                chunk
+                    .block_entities
+                    .lock()
+                    .unwrap()
+                    .get(&pos)
+                    .map(|record| record.persistence.get_long("marker"))
+            })
+            .flatten()
+            .flatten();
+        assert_eq!(marker, Some(99));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn clean_entities_are_not_serialized_during_autosave() {
+        let (world, _temp_dir) = build_world();
+        let clean_pos = BlockPos::new(0, 0, 0);
+        let dirty_pos = BlockPos::new(2, 0, 0);
+        load_chunk(&world, clean_pos);
+
+        let clean: Arc<dyn BlockEntity> = Arc::new(DirtyTestBlockEntity::new(clean_pos));
+        let dirty: Arc<dyn BlockEntity> = Arc::new(DirtyTestBlockEntity::new(dirty_pos));
+        dirty
+            .as_any()
+            .downcast_ref::<DirtyTestBlockEntity>()
+            .expect("downcast to dirty entity")
+            .set_secret(5);
+
+        insert_record(&world, clean_pos, &record_at(clean_pos, 100, None, None));
+        insert_record(&world, dirty_pos, &record_at(dirty_pos, 100, None, None));
+        insert_runtime(&world, clean_pos, 100, clean.clone());
+        insert_runtime(&world, dirty_pos, 100, dirty.clone());
+
+        world.persist_block_entities(None).await;
+
+        let clean_concrete = clean
+            .as_any()
+            .downcast_ref::<DirtyTestBlockEntity>()
+            .expect("downcast to clean entity");
+        let dirty_concrete = dirty
+            .as_any()
+            .downcast_ref::<DirtyTestBlockEntity>()
+            .expect("downcast to dirty entity");
+        // Only the dirty entity was serialised.
+        assert_eq!(clean_concrete.captures(), 0);
+        assert_eq!(dirty_concrete.captures(), 1);
+
+        let persisted_secret = world
+            .level
+            .read_chunk_sync(&dirty_pos.chunk_position(), |chunk| {
+                chunk
+                    .block_entities
+                    .lock()
+                    .unwrap()
+                    .get(&dirty_pos)
+                    .map(|record| record.persistence.get_long("secret"))
+            })
+            .flatten()
+            .flatten();
+        assert_eq!(persisted_secret, Some(5));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn private_persistence_fields_survive_packet_state_update() {
+        let (world, _temp_dir) = build_world();
+        let pos = BlockPos::new(0, 0, 0);
+        load_chunk(&world, pos);
+
+        // The canonical record's persistence carries a private field (`secret`)
+        // that the client-visible packet NBT does not contain, as produced by a
+        // prior full capture.
+        let mut persistence = NbtCompound::new();
+        persistence.put_string("id", "minecraft:test_block".to_string());
+        persistence.put_int("x", pos.0.x);
+        persistence.put_int("y", pos.0.y);
+        persistence.put_int("z", pos.0.z);
+        persistence.put_long("secret", 42);
+        let record = CanonicalBlockEntityNbt {
+            instance_id: 500,
+            block_entity_type: BlockEntityType::from_nbt(&persistence),
+            persistence,
+            initial_chunk: NbtCompound::new(),
+            update: None,
+            mutation_generation: 0,
+            persisted_generation: 0,
+        };
+        insert_record(&world, pos, &record);
+
+        let entity: Arc<dyn BlockEntity> = Arc::new(DirtyTestBlockEntity::new(pos));
+        entity
+            .as_any()
+            .downcast_ref::<DirtyTestBlockEntity>()
+            .expect("downcast to entity")
+            .set_packet_value(7);
+        insert_runtime(&world, pos, 500, entity.clone());
+
+        world.update_block_entity(&entity);
+
+        let record_after = world
+            .level
+            .read_chunk_sync(&pos.chunk_position(), |chunk| {
+                chunk
+                    .block_entities
+                    .lock()
+                    .unwrap()
+                    .get(&pos)
+                    .map(|record| {
+                        (
+                            record.persistence.get_long("secret"),
+                            record.persistence.get_long("marker"),
+                            record
+                                .update
+                                .as_ref()
+                                .and_then(|update| update.get_long("marker")),
+                        )
+                    })
+            })
+            .flatten()
+            .expect("record must still exist");
+        // The packet state update committed the client-visible NBT without
+        // clobbering the private persistence field.
+        assert_eq!(record_after.0, Some(42));
+        assert_eq!(record_after.1, None);
+        assert_eq!(record_after.2, Some(7));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn strict_unload_capture_terminates_under_mutation() {
+        let (world, _temp_dir) = build_world();
+        let pos = BlockPos::new(0, 0, 0);
+        load_chunk(&world, pos);
+
+        let level = world.level.clone();
+        let churn: Arc<dyn BlockEntity> = Arc::new(ChurnBlockEntity::new(pos, level));
+        insert_record(&world, pos, &record_at(pos, 100, Some(7), None));
+        insert_runtime(&world, pos, 100, churn);
+
+        let chunk_pos = pos.chunk_position();
+        let mut chunks = FxHashSet::default();
+        chunks.insert(chunk_pos);
+
+        // Must terminate (bounded retries) instead of spinning while the record
+        // keeps mutating, and must report the position as not persisted.
+        let still_dirty = world.persist_block_entities(Some(&chunks)).await;
+        assert!(still_dirty.contains(&pos));
     }
 }

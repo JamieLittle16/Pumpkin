@@ -271,7 +271,7 @@ impl Chunk {
                 z: 0,
                 block_ticks: ChunkTickScheduler::default(),
                 fluid_ticks: ChunkTickScheduler::default(),
-                pending_block_entities: Mutex::default(),
+                block_entities: Mutex::default(),
                 light_engine: Mutex::new(ChunkLight::default()),
                 light_populated: AtomicBool::new(false),
                 status: ChunkStatus::Empty,
@@ -299,14 +299,16 @@ impl Chunk {
             && *lighting_config == LightingEngineConfig::Default;
 
         // Convert pending block entities from structure generation to actual block entities
-        let mut pending_block_entities = FxHashMap::default();
+        let mut block_entities = FxHashMap::default();
         for nbt in proto_chunk.pending_block_entities {
             if let Some(x) = nbt.get_int("x")
                 && let Some(y) = nbt.get_int("y")
                 && let Some(z) = nbt.get_int("z")
             {
-                pending_block_entities
-                    .insert(pumpkin_util::math::position::BlockPos::new(x, y, z), nbt);
+                block_entities.insert(
+                    pumpkin_util::math::position::BlockPos::new(x, y, z),
+                    crate::chunk::CanonicalBlockEntityNbt::new(nbt),
+                );
             }
         }
 
@@ -320,7 +322,7 @@ impl Chunk {
             dirty: AtomicBool::new(true),
             block_ticks: ChunkTickScheduler::default(),
             fluid_ticks: ChunkTickScheduler::from_iter(proto_chunk.fluid_ticks),
-            pending_block_entities: Mutex::new(pending_block_entities),
+            block_entities: Mutex::new(block_entities),
             status: proto_chunk.stage.into(),
             blending_data: proto_chunk.blending_data,
             inhabited_time: AtomicU64::new(0),

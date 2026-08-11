@@ -90,6 +90,10 @@ macro_rules! impl_block_entity_for_chest {
                 self.dirty.load(std::sync::atomic::Ordering::Relaxed)
             }
 
+            fn take_dirty(&self) -> bool {
+                self.dirty.swap(false, std::sync::atomic::Ordering::AcqRel)
+            }
+
             fn clear_dirty(&self) {
                 self.dirty
                     .store(false, std::sync::atomic::Ordering::Relaxed);

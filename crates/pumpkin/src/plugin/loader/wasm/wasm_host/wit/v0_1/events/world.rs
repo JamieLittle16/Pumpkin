@@ -81,9 +81,7 @@ impl ToFromWasmEvent for ChunkLoad {
                     z: data.chunk_z,
                     block_ticks: pumpkin_world::tick::scheduler::ChunkTickScheduler::default(),
                     fluid_ticks: pumpkin_world::tick::scheduler::ChunkTickScheduler::default(),
-                    pending_block_entities: std::sync::Mutex::new(
-                        std::collections::HashMap::default(),
-                    ),
+                    block_entities: std::sync::Mutex::new(std::collections::HashMap::default()),
                     light_engine: std::sync::Mutex::new(pumpkin_world::chunk::ChunkLight::default()),
                     light_populated: std::sync::atomic::AtomicBool::new(false),
                     status: pumpkin_data::chunk::ChunkStatus::Empty,
@@ -130,9 +128,7 @@ impl ToFromWasmEvent for ChunkSave {
                     z: data.chunk_z,
                     block_ticks: pumpkin_world::tick::scheduler::ChunkTickScheduler::default(),
                     fluid_ticks: pumpkin_world::tick::scheduler::ChunkTickScheduler::default(),
-                    pending_block_entities: std::sync::Mutex::new(
-                        std::collections::HashMap::default(),
-                    ),
+                    block_entities: std::sync::Mutex::new(std::collections::HashMap::default()),
                     light_engine: std::sync::Mutex::new(pumpkin_world::chunk::ChunkLight::default()),
                     light_populated: std::sync::atomic::AtomicBool::new(false),
                     status: pumpkin_data::chunk::ChunkStatus::Empty,
@@ -178,9 +174,7 @@ impl ToFromWasmEvent for ChunkSend {
                     z: data.chunk_z,
                     block_ticks: pumpkin_world::tick::scheduler::ChunkTickScheduler::default(),
                     fluid_ticks: pumpkin_world::tick::scheduler::ChunkTickScheduler::default(),
-                    pending_block_entities: std::sync::Mutex::new(
-                        std::collections::HashMap::default(),
-                    ),
+                    block_entities: std::sync::Mutex::new(std::collections::HashMap::default()),
                     light_engine: std::sync::Mutex::new(pumpkin_world::chunk::ChunkLight::default()),
                     light_populated: std::sync::atomic::AtomicBool::new(false),
                     status: pumpkin_data::chunk::ChunkStatus::Empty,
