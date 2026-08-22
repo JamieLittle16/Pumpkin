@@ -153,7 +153,7 @@ impl Explosion {
             Vector3::new(max_x as f64, max_y as f64, max_z as f64),
         );
 
-        let entities = world.get_all_at_box(&search_box);
+        let entities = world.get_all_at_box_for(&search_box, crate::entity::spatial_metrics::QueryCaller::Explosion);
 
         for entity_base in entities {
             if entity_base.is_immune_to_explosion() {

@@ -104,6 +104,13 @@ pub mod vehicle;
 
 mod combat;
 pub mod predicate;
+pub mod spatial_grid;
+pub mod spatial_metrics;
+pub mod spatial_oracle;
+pub mod spatial_pose;
+pub mod spatial_query;
+pub mod spatial_registry;
+pub mod world_spatial_index;
 
 /// The maximum number of scoreboard tags an entity can carry, matching Vanilla.
 pub const MAX_SCOREBOARD_TAGS: usize = 1024;
@@ -515,7 +522,7 @@ pub trait EntityBase: Send + Sync + NBTStorage + std::any::Any {
 
                 let push_bb = entity_bb.expand(1.0e-7, 1.0e-7, 1.0e-7);
 
-                let other_entities = world.get_entities_at_box(&push_bb);
+                let other_entities = world.get_entities_at_box_for(&push_bb, crate::entity::spatial_metrics::QueryCaller::PushCollision);
                 for other in other_entities {
                     if other.get_entity().entity_id != self_entity.entity_id {
                         let other_type = other.get_entity().entity_type.id;
@@ -554,7 +561,7 @@ pub trait EntityBase: Send + Sync + NBTStorage + std::any::Any {
                     }
                 }
             } else {
-                let other_entities = world.get_entities_at_box(&entity_bb);
+                let other_entities = world.get_entities_at_box_for(&entity_bb, crate::entity::spatial_metrics::QueryCaller::PushCollision);
                 for other in other_entities {
                     if other.get_entity().entity_id != self_entity.entity_id {
                         dyn_self.push(&other).await;

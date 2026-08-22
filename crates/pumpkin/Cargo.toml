@@ -29,6 +29,8 @@ pumpkin-data = { workspace = true, features = ["default"] }
 pumpkin-protocol = { workspace = true, features = ["default"] }
 pumpkin-macros.workspace = true
 pumpkin-codecs.workspace = true
+bvh = "0.10.0"
+glam = "0.29"
 
 dashmap.workspace = true
 crossbeam.workspace = true
@@ -123,6 +125,11 @@ indexmap.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+criterion = { workspace = true }
+
+[[bench]]
+name = "spatial_index"
+harness = false
 
 [features]
 console-subscriber = ["dep:console-subscriber"]

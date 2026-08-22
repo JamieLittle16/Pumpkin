@@ -37,7 +37,12 @@ use crate::{
         {OnNeighborUpdateArgs, OnScheduledTickArgs},
     },
     command::client_suggestions,
-    entity::{Entity, EntityBase, NBTStorage, player::Player, r#type::from_type},
+    entity::{
+        Entity, EntityBase, NBTStorage, player::Player, r#type::from_type,
+        spatial_metrics::{QueryCaller, QueryKind, SpatialMetrics},
+        spatial_query::SpatialQueries,
+        world_spatial_index::WorldSpatialIndex,
+    },
     error::PumpkinError,
     net::{ClientPlatform, java::JavaClient},
     plugin::{
@@ -225,9 +230,9 @@ pub struct World {
     pub spawn_state: ArcSwap<SpawnState>,
     pub active_chunks: ArcSwap<FxHashSet<Vector2<i32>>>,
     pub forced_chunks: std::sync::Mutex<FxHashSet<Vector2<i32>>>,
-    /// Block entities indexed by chunk, so ticking only visits the currently
-    /// active chunks instead of scanning every loaded block entity each tick.
     pub block_entities: DashMap<Vector2<i32>, FxHashMap<BlockPos, Arc<dyn BlockEntity>>>,
+    pub spatial_metrics: Arc<SpatialMetrics>,
+    pub spatial_index: Arc<WorldSpatialIndex>,
 }
 
 impl PartialEq for World {
@@ -293,6 +298,8 @@ impl World {
         let portal_poi = portal::PortalPoiStorage::new(level.level_folder.poi_folder.clone());
         let dragon_fight = (dimension.minecraft_name == Dimension::THE_END.minecraft_name)
             .then(|| Mutex::new(dragon_fight::DragonFight::new()));
+        let spatial_metrics = Arc::new(SpatialMetrics::new());
+        let spatial_index = Arc::new(WorldSpatialIndex::new(spatial_metrics.clone()));
         Self {
             uuid: Uuid::new_v4(),
             level,
@@ -316,6 +323,8 @@ impl World {
             forced_chunks: std::sync::Mutex::new(FxHashSet::default()),
             server,
             block_entities: DashMap::new(),
+            spatial_metrics,
+            spatial_index,
         }
     }
 
@@ -3842,39 +3851,107 @@ impl World {
 
     // Gets all entities at a Box
     pub fn get_all_at_box(&self, aabb: &BoundingBox) -> Vec<Arc<dyn EntityBase>> {
-        let entities_guard = self.entities.load();
-        let players_guard = self.players.load();
+        self.get_all_at_box_for(aabb, QueryCaller::Other)
+    }
 
-        entities_guard
-            .iter()
-            .map(|e| e.clone() as Arc<dyn EntityBase>)
-            .chain(
-                players_guard
-                    .iter()
-                    .map(|p| p.clone() as Arc<dyn EntityBase>),
-            )
+    pub fn get_all_at_box_for(&self, aabb: &BoundingBox, caller: QueryCaller) -> Vec<Arc<dyn EntityBase>> {
+        let start = std::time::Instant::now();
+        let mask = match caller {
+            QueryCaller::Projectile => crate::entity::spatial_pose::SpatialCategory::PROJECTILE | crate::entity::spatial_pose::SpatialCategory::DAMAGEABLE,
+            QueryCaller::Explosion => crate::entity::spatial_pose::SpatialCategory::DAMAGEABLE | crate::entity::spatial_pose::SpatialCategory::ITEM,
+            _ => crate::entity::spatial_pose::SpatialCategory::all(),
+        };
+
+        let candidates = self.spatial_index.query_candidates(
+            1,
+            aabb,
+            mask,
+        );
+
+        let results: Vec<Arc<dyn EntityBase>> = candidates
+            .into_iter()
             .filter(|entity| entity.get_entity().bounding_box.load().intersects(aabb))
-            .collect()
+            .collect();
+
+        self.spatial_metrics.record_query(
+            caller,
+            QueryKind::Aabb,
+            results.len(),
+            results.len(),
+            start.elapsed().as_nanos() as u64,
+        );
+
+        results
     }
 
     // Gets all non Player entities at a Box
     pub fn get_entities_at_box(&self, aabb: &BoundingBox) -> Vec<Arc<dyn EntityBase>> {
-        self.entities
-            .load()
-            .iter()
+        self.get_entities_at_box_for(aabb, QueryCaller::Other)
+    }
+
+    pub fn get_entities_at_box_for(&self, aabb: &BoundingBox, caller: QueryCaller) -> Vec<Arc<dyn EntityBase>> {
+        let start = std::time::Instant::now();
+        let mask = match caller {
+            QueryCaller::ItemMerge => crate::entity::spatial_pose::SpatialCategory::ITEM,
+            QueryCaller::PushCollision => crate::entity::spatial_pose::SpatialCategory::PUSHABLE,
+            _ => crate::entity::spatial_pose::SpatialCategory::all(),
+        };
+
+        let candidates = self.spatial_index.query_candidates(
+            1,
+            aabb,
+            mask,
+        );
+
+        let results: Vec<Arc<dyn EntityBase>> = candidates
+            .into_iter()
             .filter(|entity| entity.get_entity().bounding_box.load().intersects(aabb))
-            .cloned()
-            .collect()
+            .collect();
+
+        self.spatial_metrics.record_query(
+            caller,
+            QueryKind::Aabb,
+            results.len(),
+            results.len(),
+            start.elapsed().as_nanos() as u64,
+        );
+
+        results
     }
 
     // Gets all Player entities at a Box
     pub fn get_players_at_box(&self, aabb: &BoundingBox) -> Vec<Arc<Player>> {
-        let players_guard = self.players.load();
-        players_guard
-            .iter()
-            .filter(|player| player.get_entity().bounding_box.load().intersects(aabb))
-            .cloned()
-            .collect()
+        self.get_players_at_box_for(aabb, QueryCaller::Other)
+    }
+
+    pub fn get_players_at_box_for(&self, aabb: &BoundingBox, caller: QueryCaller) -> Vec<Arc<Player>> {
+        let start = std::time::Instant::now();
+        let candidates = self.spatial_index.query_candidates(
+            1,
+            aabb,
+            crate::entity::spatial_pose::SpatialCategory::PLAYER,
+        );
+
+        let results: Vec<Arc<Player>> = candidates
+            .into_iter()
+            .filter_map(|entity| {
+                if entity.get_entity().bounding_box.load().intersects(aabb) {
+                    self.get_player_by_uuid(entity.get_entity().entity_uuid)
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        self.spatial_metrics.record_query(
+            caller,
+            QueryKind::Aabb,
+            results.len(),
+            results.len(),
+            start.elapsed().as_nanos() as u64,
+        );
+
+        results
     }
 
     /// Retrieves a player by their unique UUID.
@@ -3949,14 +4026,25 @@ impl World {
     /// * `pos`: The center of the sphere.
     /// * `radius`: The radius of the sphere. The higher the radius, the more area will be checked (in every direction).
     pub fn get_nearby_players(&self, pos: Vector3<f64>, radius: f64) -> Vec<Arc<Player>> {
-        let radius_squared = radius.powi(2);
+        let bounding_box = BoundingBox::new(
+            Vector3::new(pos.x - radius, pos.y - radius, pos.z - radius),
+            Vector3::new(pos.x + radius, pos.y + radius, pos.z + radius),
+        );
+        let candidates = self.spatial_index.query_candidates(
+            1,
+            &bounding_box,
+            crate::entity::spatial_pose::SpatialCategory::PLAYER,
+        );
 
-        self.players
-            .load()
-            .iter()
-            .filter_map(|player| {
-                let player_pos = player.get_entity().pos.load();
-                (player_pos.squared_distance_to_vec(&pos) <= radius_squared).then(|| player.clone())
+        let radius_squared = radius.powi(2);
+        candidates
+            .into_iter()
+            .filter_map(|entity| {
+                if entity.get_entity().pos.load().squared_distance_to_vec(&pos) <= radius_squared {
+                    self.get_player_by_uuid(entity.get_entity().entity_uuid)
+                } else {
+                    None
+                }
             })
             .collect()
     }
@@ -3966,15 +4054,25 @@ impl World {
         pos: Vector3<f64>,
         radius: f64,
     ) -> HashMap<uuid::Uuid, Arc<dyn EntityBase>> {
-        let radius_squared = radius.powi(2);
+        let bounding_box = BoundingBox::new(
+            Vector3::new(pos.x - radius, pos.y - radius, pos.z - radius),
+            Vector3::new(pos.x + radius, pos.y + radius, pos.z + radius),
+        );
+        let candidates = self.spatial_index.query_candidates(
+            1,
+            &bounding_box,
+            crate::entity::spatial_pose::SpatialCategory::all(),
+        );
 
-        self.entities
-            .load()
-            .iter()
+        let radius_squared = radius.powi(2);
+        candidates
+            .into_iter()
             .filter_map(|entity| {
-                let entity_pos = entity.get_entity().pos.load();
-                (entity_pos.squared_distance_to_vec(&pos) <= radius_squared)
-                    .then(|| (entity.get_entity().entity_uuid, entity.clone()))
+                if entity.get_entity().pos.load().squared_distance_to_vec(&pos) <= radius_squared {
+                    Some((entity.get_entity().entity_uuid, entity))
+                } else {
+                    None
+                }
             })
             .collect()
     }
@@ -4058,9 +4156,38 @@ impl World {
         bounding_box: BoundingBox,
         predicate: impl Fn(&dyn EntityBase) -> bool,
     ) {
+        self.extend_entities_in_box_where_for(
+            list,
+            max_list_capacity,
+            bounding_box,
+            QueryCaller::EntitySelector,
+            predicate,
+        );
+    }
+
+    pub fn extend_entities_in_box_where_for(
+        &self,
+        list: &mut Vec<Arc<dyn EntityBase>>,
+        max_list_capacity: usize,
+        bounding_box: BoundingBox,
+        caller: QueryCaller,
+        predicate: impl Fn(&dyn EntityBase) -> bool,
+    ) {
+        let start = std::time::Instant::now();
+        let initial_len = list.len();
         self.extend_entities_where(list, max_list_capacity, |e| {
             bounding_box.intersects(&e.get_entity().bounding_box.load()) && predicate(e)
         });
+        let added = list.len().saturating_sub(initial_len);
+        let examined = self.players.load().len() + self.entities.load().len();
+
+        self.spatial_metrics.record_query(
+            caller,
+            QueryKind::Aabb,
+            examined,
+            added,
+            start.elapsed().as_nanos() as u64,
+        );
     }
 
     /// Adds entities to the provided [`Vec`] that satisfy a particular condition.
@@ -5572,6 +5699,84 @@ impl BlockAccessor for World {
             .get_block_state_id_if_loaded(position)
             .unwrap_or(Block::AIR.default_state.id);
         BlockState::from_id_with_block(id)
+    }
+}
+
+impl SpatialQueries for World {
+    fn query_aabb_for(&self, bounds: &BoundingBox, caller: QueryCaller) -> Vec<Arc<dyn EntityBase>> {
+        self.get_all_at_box_for(bounds, caller)
+    }
+
+    fn query_sphere_for(
+        &self,
+        center: pumpkin_util::math::vector3::Vector3<f64>,
+        radius: f64,
+        caller: QueryCaller,
+    ) -> Vec<Arc<dyn EntityBase>> {
+        let start = std::time::Instant::now();
+        let r_sq = radius * radius;
+        let bounds = BoundingBox::new(
+            pumpkin_util::math::vector3::Vector3::new(center.x - radius, center.y - radius, center.z - radius),
+            pumpkin_util::math::vector3::Vector3::new(center.x + radius, center.y + radius, center.z + radius),
+        );
+
+        let candidates = self.spatial_index.query_candidates(
+            1,
+            &bounds,
+            crate::entity::spatial_pose::SpatialCategory::all(),
+        );
+
+        let results: Vec<Arc<dyn EntityBase>> = candidates
+            .into_iter()
+            .filter(|entity| {
+                let pose = entity.get_entity().pos.load();
+                let dx = pose.x - center.x;
+                let dy = pose.y - center.y;
+                let dz = pose.z - center.z;
+                (dx * dx + dy * dy + dz * dz) <= r_sq
+            })
+            .collect();
+
+        self.spatial_metrics.record_query(
+            caller,
+            QueryKind::Sphere,
+            results.len(),
+            results.len(),
+            start.elapsed().as_nanos() as u64,
+        );
+
+        results
+    }
+
+    fn query_swept_aabb_for(
+        &self,
+        bounds: &BoundingBox,
+        movement: pumpkin_util::math::vector3::Vector3<f64>,
+        caller: QueryCaller,
+    ) -> Vec<Arc<dyn EntityBase>> {
+        let start = std::time::Instant::now();
+        let swept_box = bounds.expand(movement.x.abs(), movement.y.abs(), movement.z.abs());
+
+        let candidates = self.spatial_index.query_candidates(
+            1,
+            &swept_box,
+            crate::entity::spatial_pose::SpatialCategory::all(),
+        );
+
+        let results: Vec<Arc<dyn EntityBase>> = candidates
+            .into_iter()
+            .filter(|entity| entity.get_entity().bounding_box.load().intersects(&swept_box))
+            .collect();
+
+        self.spatial_metrics.record_query(
+            caller,
+            QueryKind::Aabb,
+            results.len(),
+            results.len(),
+            start.elapsed().as_nanos() as u64,
+        );
+
+        results
     }
 }
 
