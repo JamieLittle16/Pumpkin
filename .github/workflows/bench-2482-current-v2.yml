@@ -1,0 +1,18 @@
+name: PR 2482 final encryption benchmark
+
+on:
+  push:
+    branches:
+      - bench/2482-current-encryption-v2
+
+jobs:
+  benchmark:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: recursive
+      - name: Install Rust
+        run: rustup update stable && rustup default stable
+      - name: Run final encryption benchmark
+        run: cargo bench -p pumpkin-protocol --bench stream_encryption_current -- --noplot
