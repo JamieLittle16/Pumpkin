@@ -163,8 +163,10 @@ type Aes128Cfb8Enc = cfb8::Encryptor<aes::Aes128>;
 const STREAM_ENCRYPTION_BUFFER_SIZE: usize = 16 * 1024;
 
 /// Coalesces CFB8 ciphertext so one-byte cipher blocks do not become one-byte
-/// downstream writes. Ciphertext stays owned by this adapter until the wrapped
-/// writer accepts it, which also makes partial writes and `Poll::Pending` safe.
+/// downstream writes.
+///
+/// Ciphertext stays owned by this adapter until the wrapped writer accepts it,
+/// which also makes partial writes and `Poll::Pending` safe.
 pub struct StreamEncryptor<W: AsyncWrite + Unpin> {
     cipher: Aes128Cfb8Enc,
     write: W,
