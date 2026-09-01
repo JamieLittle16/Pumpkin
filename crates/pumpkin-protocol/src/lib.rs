@@ -570,7 +570,8 @@ pub enum LinkType {
 #[cfg(test)]
 mod stream_encryptor_tests {
     use super::*;
-    use aes::cipher::{AsyncStreamCipher, KeyIvInit};
+    use aes::cipher::KeyIvInit;
+    use cfb8::cipher::AsyncStreamCipher;
     use std::sync::{
         Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
