@@ -39,7 +39,12 @@ bitflags.workspace = true
 xxhash-rust.workspace = true
 
 [dev-dependencies]
+criterion.workspace = true
 # Validate correctness
+
+[[bench]]
+name = "packet_compression_2489"
+harness = false
 
 [lints]
 workspace = true
