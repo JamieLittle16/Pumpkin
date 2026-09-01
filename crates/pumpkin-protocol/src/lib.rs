@@ -571,7 +571,6 @@ pub enum LinkType {
 mod stream_encryptor_tests {
     use super::*;
     use aes::cipher::KeyIvInit;
-    use cfb8::cipher::AsyncStreamCipher;
     use std::sync::{
         Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
@@ -620,10 +619,15 @@ mod stream_encryptor_tests {
     async fn stream_encryptor_preserves_ciphertext_through_partial_pending_writes() {
         let key = [0x2a; 16];
         let plaintext: Vec<u8> = (0..50_000).map(|index| (index % 251) as u8).collect();
-        let mut expected = plaintext.clone();
-        cfb8::Encryptor::<aes::Aes128>::new_from_slices(&key, &key)
-            .unwrap()
-            .encrypt(&mut expected);
+        let mut reference_cipher =
+            cfb8::Encryptor::<aes::Aes128>::new_from_slices(&key, &key).unwrap();
+        let mut expected = Vec::with_capacity(plaintext.len());
+        for block in plaintext.chunks(Aes128Cfb8Enc::block_size()) {
+            let mut out = [0u8];
+            let out_block: &mut Array<u8, U1> = (&mut out[..]).try_into().unwrap();
+            reference_cipher.encrypt_b2b(block, out_block).unwrap();
+            expected.push(out[0]);
+        }
 
         let bytes = Arc::new(Mutex::new(Vec::new()));
         let writes = Arc::new(AtomicUsize::new(0));
