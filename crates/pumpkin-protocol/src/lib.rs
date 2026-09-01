@@ -10,7 +10,6 @@ use std::{
 use aes::cipher::BlockSizeUser;
 use bytes::Bytes;
 use codec::var_int::VarInt;
-use hybrid_array::{Array, sizes::U1};
 use pumpkin_util::{
     resource_location::ResourceLocation,
     text::{TextComponent, style::Style},
@@ -162,7 +161,7 @@ type Aes128Cfb8Enc = cfb8::Encryptor<aes::Aes128>;
 
 const STREAM_ENCRYPTION_BUFFER_SIZE: usize = 16 * 1024;
 
-/// Coalesces CFB8 ciphertext so one-byte cipher blocks do not become one-byte
+/// Coalesces CFB8 ciphertext so encrypted bytes do not become one-byte
 /// downstream writes.
 ///
 /// Ciphertext stays owned by this adapter until the wrapped writer accepts it,
@@ -176,7 +175,6 @@ pub struct StreamEncryptor<W: AsyncWrite + Unpin> {
 
 impl<W: AsyncWrite + Unpin> StreamEncryptor<W> {
     pub fn new(cipher: Aes128Cfb8Enc, stream: W) -> Self {
-        debug_assert_eq!(Aes128Cfb8Enc::block_size(), 1);
         Self {
             cipher,
             write: stream,
@@ -208,15 +206,15 @@ impl<W: AsyncWrite + Unpin> StreamEncryptor<W> {
     }
 
     fn buffer_plaintext(&mut self, plaintext: &[u8]) -> Result<(), Error> {
-        for block in plaintext.chunks(Aes128Cfb8Enc::block_size()) {
-            let mut out = [0u8];
-            let out_block: &mut Array<u8, U1> = (&mut out[..])
-                .try_into()
-                .map_err(|_| Error::other("Output slice size does not match block size"))?;
-            self.cipher
-                .encrypt_b2b(block, out_block)
-                .map_err(|_| Error::other("Encryption failed"))?;
-            self.pending_ciphertext.push(out[0]);
+        let start = self.pending_ciphertext.len();
+        self.pending_ciphertext.resize(start + plaintext.len(), 0);
+        if self
+            .cipher
+            .encrypt_b2b(plaintext, &mut self.pending_ciphertext[start..])
+            .is_err()
+        {
+            self.pending_ciphertext.truncate(start);
+            return Err(Error::other("Encryption input/output lengths do not match"));
         }
         Ok(())
     }
@@ -619,15 +617,11 @@ mod stream_encryptor_tests {
     async fn stream_encryptor_preserves_ciphertext_through_partial_pending_writes() {
         let key = [0x2a; 16];
         let plaintext: Vec<u8> = (0..50_000).map(|index| (index % 251) as u8).collect();
-        let mut reference_cipher =
-            cfb8::Encryptor::<aes::Aes128>::new_from_slices(&key, &key).unwrap();
-        let mut expected = Vec::with_capacity(plaintext.len());
-        for block in plaintext.chunks(Aes128Cfb8Enc::block_size()) {
-            let mut out = [0u8];
-            let out_block: &mut Array<u8, U1> = (&mut out[..]).try_into().unwrap();
-            reference_cipher.encrypt_b2b(block, out_block).unwrap();
-            expected.push(out[0]);
-        }
+        let mut expected = vec![0; plaintext.len()];
+        cfb8::Encryptor::<aes::Aes128>::new_from_slices(&key, &key)
+            .unwrap()
+            .encrypt_b2b(&plaintext, &mut expected)
+            .unwrap();
 
         let bytes = Arc::new(Mutex::new(Vec::new()));
         let writes = Arc::new(AtomicUsize::new(0));
