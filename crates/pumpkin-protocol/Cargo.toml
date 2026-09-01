@@ -38,7 +38,11 @@ bitflags.workspace = true
 xxhash-rust.workspace = true
 
 [dev-dependencies]
-# Validate correctness
+criterion = { workspace = true, features = ["async_tokio"] }
+
+[[bench]]
+name = "stream_encryption_current"
+harness = false
 
 [lints]
 workspace = true
