@@ -1,0 +1,51 @@
+name: Closeout rebase 2506
+
+on:
+  push:
+    branches:
+      - automation/rebase-2506
+
+permissions:
+  contents: write
+
+jobs:
+  rebase:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: true
+      - name: Rebuild PR 2506 on current upstream master
+        shell: bash
+        run: |
+          set -euxo pipefail
+          git config user.name "JamieLittle16"
+          git config user.email "160879046+JamieLittle16@users.noreply.github.com"
+          git remote add upstream https://github.com/Pumpkin-MC/Pumpkin.git || true
+          git fetch upstream master
+          git fetch origin archive/2506-noise-pre-rebase
+
+          OLD_HEAD="$(git rev-parse origin/archive/2506-noise-pre-rebase)"
+          OLD_PARENT="$(git rev-parse "${OLD_HEAD}^")"
+          git diff --binary "$OLD_PARENT" "$OLD_HEAD" -- pumpkin-world > /tmp/old.patch
+          sed -e 's#a/pumpkin-world/#a/crates/pumpkin-world/#g' \
+              -e 's#b/pumpkin-world/#b/crates/pumpkin-world/#g' \
+              -e 's#--- a/pumpkin-world/#--- a/crates/pumpkin-world/#g' \
+              -e 's#+++ b/pumpkin-world/#+++ b/crates/pumpkin-world/#g' \
+              /tmp/old.patch > /tmp/current-paths.patch
+
+          git switch --detach upstream/master
+          if ! git apply --3way --index /tmp/current-paths.patch; then
+            echo "=== APPLY FAILED ==="
+            git status --short
+            git diff --check || true
+            git diff || true
+            exit 1
+          fi
+
+          cargo fmt --all
+          git add -A
+          git diff --cached --check
+          git commit -m "perf(world): optimize chunk noise generation and buffer allocations"
+          git push --force origin HEAD:perf/noise-generation
