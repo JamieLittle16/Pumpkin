@@ -40,3 +40,5 @@ jobs:
           git diff --cached --check || true
           cargo check -p pumpkin-protocol -p pumpkin --all-targets
           git push --force origin HEAD:pr1-rebuild
+
+# inspect against upstream master 4e6d380b
