@@ -50,3 +50,5 @@ jobs:
           cargo test -p pumpkin-world --lib generation::proto_chunk_test
           git commit -m "perf(world): optimize chunk noise generation and buffer allocations"
           git push --force origin HEAD:perf/noise-generation
+
+# rerun against upstream master 4e6d380b
