@@ -4395,10 +4395,11 @@ impl World {
         for chunk_pos in &chunks_set {
             // Drop the chunk's runtime map, keeping only block entities whose capture
             // did not complete (so their newer state is not lost to the disk save).
-            self.block_entities.alter(chunk_pos, |_, mut chunk_block_entities| {
-                chunk_block_entities.retain(|block_pos, _| still_dirty.contains(block_pos));
-                chunk_block_entities
-            });
+            self.block_entities
+                .alter(chunk_pos, |_, mut chunk_block_entities| {
+                    chunk_block_entities.retain(|block_pos, _| still_dirty.contains(block_pos));
+                    chunk_block_entities
+                });
             self.block_entities
                 .remove_if(chunk_pos, |_, entities| entities.is_empty());
         }
@@ -4417,7 +4418,7 @@ impl World {
     /// at most `MAX_PERSIST_RETRIES` times; if it still cannot be captured its
     /// position is returned so callers can keep the runtime entity alive instead
     /// of spinning forever or dropping state.
-    #[expect(clippy::while_let_loop, clippy::needless_continue)]
+    #[expect(clippy::while_let_loop)]
     async fn persist_block_entities(
         &self,
         chunks: Option<&FxHashSet<Vector2<i32>>>,
@@ -6514,9 +6515,7 @@ mod block_entity_persistence_tests {
             let position = self.position;
             Box::pin(async move {
                 level.read_chunk_sync(&position.chunk_position(), |chunk| {
-                    if let Some(record) =
-                        chunk.block_entities.lock().unwrap().get_mut(&position)
-                    {
+                    if let Some(record) = chunk.block_entities.lock().unwrap().get_mut(&position) {
                         record.begin_mutation();
                     }
                 });

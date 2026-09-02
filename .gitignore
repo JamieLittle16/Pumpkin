@@ -127,6 +127,15 @@ run/
 *flamegraph.svg
 *dhat*
 *bench_root_tmp*
+.bench-targets/
+.bench-results/
+benchmarks/chunk_packet_cache/__pycache__/
+benchmarks/chunk_packet_cache/matrix.local.json
+benchmarks/chunk_packet_cache/matrix.equalwork.json
+benchmarks/chunk_packet_cache/matrix.attribution.json
+benchmarks/chunk_packet_cache/matrix.smoke.json
+benchmarks/chunk_packet_cache/benchmark-results-full.md
+benchmarks/chunk_packet_cache/equalwork-report.md
 
 
 # Nix (direnv and result)

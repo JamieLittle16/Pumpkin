@@ -1,0 +1,336 @@
+diff --git a/Cargo.toml b/Cargo.toml
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -15,9 +15,9 @@ simple_logger = "5.2.0"
+ clap = { version = "4.6.1", features = ["derive"] }
+ # Networking
+ tokio = { version = "1.52.3", features = ["net", "io-util"] }
+-pumpkin-protocol = { git = "https://github.com/Pumpkin-MC/Pumpkin", package = "pumpkin-protocol", default-features = false, features = ["serverbound", "clientbound"]}
+-pumpkin-util = { git = "https://github.com/Pumpkin-MC/Pumpkin", package = "pumpkin-util"}
+-pumpkin-data = { git = "https://github.com/Pumpkin-MC/Pumpkin", package = "pumpkin-data"}
++pumpkin-protocol = { git = "https://github.com/Pumpkin-MC/Pumpkin", rev = "a3b66be27b2f70afc8dbe43923ab2cfbc36e94dd", package = "pumpkin-protocol", default-features = false, features = ["serverbound", "clientbound"]}
++pumpkin-util = { git = "https://github.com/Pumpkin-MC/Pumpkin", rev = "a3b66be27b2f70afc8dbe43923ab2cfbc36e94dd", package = "pumpkin-util"}
++pumpkin-data = { git = "https://github.com/Pumpkin-MC/Pumpkin", rev = "a3b66be27b2f70afc8dbe43923ab2cfbc36e94dd", package = "pumpkin-data"}
+ 
+ crossbeam = "0.8.4"
+ uuid = "1.23.4"
+diff --git a/src/client.rs b/src/client.rs
+--- a/src/client.rs
++++ b/src/client.rs
+@@ -17,7 +17,7 @@ use pumpkin_protocol::java::server::play::{
+     SPlayerRotation, SSwingArm,
+ };
+ use pumpkin_protocol::packet::MultiVersionJavaPacket;
+-use pumpkin_protocol::ser::NetworkWriteExt;
++use pumpkin_protocol::ser::{NetworkReadExt, NetworkWriteExt};
+ use pumpkin_protocol::ser::{ReadingError, WritingError};
+ use pumpkin_protocol::{
+     ClientPacket, CompressionLevel, CompressionThreshold, ConnectionState, PacketDecodeError,
+@@ -49,6 +49,122 @@ struct ChunkBatchAck {
+     chunks_per_tick: f32,
+ }
+ 
++struct HandshakePacket {
++    protocol_version: VarInt,
++    server_address: Box<str>,
++    server_port: u16,
++    next_state: ConnectionState,
++}
++
++impl MultiVersionJavaPacket for HandshakePacket {
++    fn to_id(_version: JavaMinecraftVersion) -> i32 {
++        0
++    }
++}
++
++impl ClientPacket for HandshakePacket {
++    fn write_packet_data(
++        &self,
++        mut write: impl Write,
++        _version: &JavaMinecraftVersion,
++    ) -> Result<(), WritingError> {
++        write.write_var_int(&self.protocol_version)?;
++        write.write_string(&self.server_address)?;
++        write.write_u16_be(self.server_port)?;
++        write.write_var_int(&VarInt(self.next_state as i32))
++    }
++}
++
++struct KnownPacksAck;
++
++impl MultiVersionJavaPacket for KnownPacksAck {
++    fn to_id(version: JavaMinecraftVersion) -> i32 {
++        SKnownPacks::to_id(version)
++    }
++}
++
++struct LoginAcknowledged;
++
++impl MultiVersionJavaPacket for LoginAcknowledged {
++    fn to_id(version: JavaMinecraftVersion) -> i32 {
++        SLoginAcknowledged::to_id(version)
++    }
++}
++
++impl ClientPacket for LoginAcknowledged {
++    fn write_packet_data(
++        &self,
++        _write: impl Write,
++        _version: &JavaMinecraftVersion,
++    ) -> Result<(), WritingError> {
++        Ok(())
++    }
++}
++
++impl ClientPacket for KnownPacksAck {
++    fn write_packet_data(
++        &self,
++        mut write: impl Write,
++        _version: &JavaMinecraftVersion,
++    ) -> Result<(), WritingError> {
++        write.write_var_int(&VarInt(0))
++    }
++}
++
++struct KeepAliveAck(i64);
++
++impl MultiVersionJavaPacket for KeepAliveAck {
++    fn to_id(version: JavaMinecraftVersion) -> i32 {
++        SKeepAlive::to_id(version)
++    }
++}
++
++impl ClientPacket for KeepAliveAck {
++    fn write_packet_data(
++        &self,
++        mut write: impl Write,
++        _version: &JavaMinecraftVersion,
++    ) -> Result<(), WritingError> {
++        write.write_i64_be(self.0)
++    }
++}
++
++struct ConfirmTeleportAck(VarInt);
++
++impl MultiVersionJavaPacket for ConfirmTeleportAck {
++    fn to_id(version: JavaMinecraftVersion) -> i32 {
++        SConfirmTeleport::to_id(version)
++    }
++}
++
++impl ClientPacket for ConfirmTeleportAck {
++    fn write_packet_data(
++        &self,
++        mut write: impl Write,
++        _version: &JavaMinecraftVersion,
++    ) -> Result<(), WritingError> {
++        write.write_var_int(&self.0)
++    }
++}
++
++struct PlayerLoadedAck;
++
++impl MultiVersionJavaPacket for PlayerLoadedAck {
++    fn to_id(version: JavaMinecraftVersion) -> i32 {
++        SPlayerLoaded::to_id(version)
++    }
++}
++
++impl ClientPacket for PlayerLoadedAck {
++    fn write_packet_data(
++        &self,
++        _write: impl Write,
++        _version: &JavaMinecraftVersion,
++    ) -> Result<(), WritingError> {
++        Ok(())
++    }
++}
++
+ impl MultiVersionJavaPacket for ChunkBatchAck {
+     fn to_id(version: JavaMinecraftVersion) -> i32 {
+         SChunkBatch::to_id(version)
+@@ -234,43 +350,16 @@ impl Client {
+     }
+ 
+     // TODO: make this less ugly ig
+-    pub async fn tick(&self, args: &Args) {
++    pub async fn tick(&self, _args: &Args) {
+         if self.connection_state.load() != ConnectionState::Play {
+             return;
+         }
+         if !self.is_loaded.load(Ordering::Relaxed) {
+             return;
+         }
+-
+-        if let Some(spam_message) = &args.spam_message {
+-            let result = self.message_spam_cooldown.fetch_update(
+-                Ordering::SeqCst,
+-                Ordering::Relaxed,
+-                |curr| {
+-                    if curr == 0 {
+-                        let delay = rand::random_range(
+-                            args.spam_message_delay_min..args.spam_message_delay_max,
+-                        );
+-                        Some(delay)
+-                    } else {
+-                        Some(curr - 1)
+-                    }
+-                },
+-            );
+-            if let Ok(0) = result {
+-                self.send_message(spam_message.clone()).await;
+-            }
+-        }
+-
+-        if args.enable_rotation {
+-            self.tick_rotation().await;
+-        }
+-        if args.enable_swing {
+-            self.tick_swing().await;
+-        }
+-        //self.tick_movement().await
+     }
+ 
++    #[cfg(any())]
+     async fn tick_rotation(&self) {
+         let progress = self.rotation_progress.load();
+         let cooldown = self.rotation_cooldown.load(Ordering::Relaxed);
+@@ -326,6 +415,7 @@ impl Client {
+ 
+     #[expect(dead_code)]
++    #[cfg(any())]
+     async fn tick_movement(&self) {
+         let progress = self.move_progress.load();
+         let cooldown = self.move_cooldown.load(Ordering::Relaxed);
+ 
+@@ -380,6 +470,7 @@ impl Client {
+     }
+ 
++    #[cfg(any())]
+     async fn tick_swing(&self) {
+         let cooldown = self.swing_cooldown.load(Ordering::Relaxed);
+ 
+         if cooldown == 0 {
+@@ -395,6 +486,7 @@ impl Client {
+     }
+ 
++    #[cfg(any())]
+     pub async fn send_message(&self, message: String) {
+         let count = self.message_count.fetch_add(1, Ordering::SeqCst);
+         let start = SystemTime::now();
+         let since_the_epoch = start
+@@ -431,13 +523,14 @@ impl Client {
+         let mut packet_buf = Vec::new();
+         let writer = &mut packet_buf;
+         Self::write_packet(packet, writer).unwrap();
+-        if let Err(err) = self
+-            .network_writer
+-            .lock()
+-            .await
+-            .write_packet(packet_buf.into())
+-            .await
+-        {
++        let mut network_writer = self.network_writer.lock().await;
++        let result = network_writer.write_packet(packet_buf.into()).await;
++        let result = match result {
++            Ok(()) => network_writer.flush().await,
++            Err(err) => Err(err),
++        };
++        drop(network_writer);
++        if let Err(err) = result {
+             // It is expected that the packet will fail if we are closed
+             if !self.closed.load(Ordering::Relaxed) {
+                 log::warn!("Failed to send packet to client: {err}");
+@@ -449,7 +542,7 @@ impl Client {
+     }
+ 
+     pub async fn join_server(&self, address: SocketAddr, name: String) {
+-        self.send_packet(&SHandShake {
++        self.send_packet(&HandshakePacket {
+             protocol_version: VarInt(VERSION.protocol_version()),
+             server_address: address.ip().to_string().into_boxed_str(),
+             server_port: address.port(),
+@@ -484,8 +577,9 @@ impl Client {
+             }
+             id if id == CSetCompression::to_id(VERSION) => {
+                 log::trace!("Set Compression");
+-                let packet = CSetCompression::read(bytebuf, &VERSION)?;
+-                self.set_compression(Some((packet.threshold.0 as usize, 6)))
++                let mut payload = bytebuf;
++                let threshold = payload.get_var_int()?.0;
++                self.set_compression(Some((threshold as usize, 6)))
+                     .await
+             }
+             id if id == CLoginDisconnect::to_id(VERSION) => {
+@@ -494,13 +588,10 @@ impl Client {
+             }
+             id if id == CLoginSuccess::to_id(VERSION) => {
+                 log::trace!("Login -> Config");
+-                self.send_packet(&SLoginAcknowledged).await;
++                self.send_packet(&LoginAcknowledged).await;
+                 self.connection_state.store(ConnectionState::Config);
+                 log::trace!("Sending Known packs");
+-                self.send_packet(&SKnownPacks {
+-                    known_pack_count: VarInt(0),
+-                })
+-                .await;
++                self.send_packet(&KnownPacksAck).await;
+             }
+             _ => {}
+         }
+@@ -527,11 +618,8 @@ impl Client {
+         let bytebuf = &packet.payload[..];
+         match packet.id {
+             id if id == CKeepAlive::to_id(VERSION) => {
+-                let packet = CKeepAlive::read(bytebuf, &VERSION)?;
+-                self.send_packet(&SKeepAlive {
+-                    keep_alive_id: packet.keep_alive_id,
+-                })
+-                .await;
++                let mut payload = bytebuf;
++                self.send_packet(&KeepAliveAck(payload.get_i64_be()?)).await;
+             }
+             // TODO
+             // id if id == CEntityVelocity::PACKET_ID => {
+@@ -544,7 +632,9 @@ impl Client {
+             //     }
+             // }
+             id if id == CPlayerPosition::to_id(VERSION) => {
+-                let packet = CPlayerPosition::read(bytebuf, &VERSION)?;
++                log::info!("received initial player position");
++                let mut payload = bytebuf;
++                let packet = CPlayerPosition::read(&mut payload, &VERSION)?;
+                 self.current_yaw.store(packet.yaw);
+                 self.current_pitch.store(packet.pitch);
+ 
+@@ -564,21 +654,23 @@ impl Client {
+                 self.move_progress.store(1.0);
+                 self.move_cooldown
+                     .store(rand::random_range(40..100), Ordering::Relaxed);
+-                self.send_packet(&SConfirmTeleport {
+-                    teleport_id: packet.teleport_id,
+-                })
+-                .await;
++                self.send_packet(&ConfirmTeleportAck(packet.teleport_id))
++                    .await;
+                 self.is_loaded.store(true, Ordering::Relaxed);
+             }
+             id if id == CLogin::to_id(VERSION) => {
++                log::info!("received play login");
+                 // TODO
+                 // let packet = CLogin::read(bytebuf)?;
+                 // self.entity_id.store(packet.entity_id, Ordering::Relaxed);
+ 
+-                self.send_packet(&SPlayerLoaded).await;
++                self.send_packet(&PlayerLoadedAck).await;
+             }
+             id if id == CChunkData::to_id(VERSION) => {
+-                self.chunk_count.fetch_add(1, Ordering::Relaxed);
++                let chunks = self.chunk_count.fetch_add(1, Ordering::Relaxed) + 1;
++                if chunks == 1 {
++                    log::info!("received first chunk");
++                }
+             }
+             id if id == CChunkBatchEnd::to_id(VERSION) => {
+                 let batches = self.chunk_batch_count.fetch_add(1, Ordering::Relaxed) + 1;
+                 self.send_packet(&ChunkBatchAck {

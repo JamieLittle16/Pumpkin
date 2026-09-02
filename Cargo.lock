@@ -2620,6 +2620,7 @@ dependencies = [
  "bytes",
  "colored",
  "console-subscriber",
+ "criterion",
  "crossbeam",
  "dashmap",
  "ed25519-dalek",

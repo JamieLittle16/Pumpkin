@@ -1,0 +1,20 @@
+[
+  {
+    "name": "master",
+    "binary": "/home/Jamie/Documents/pumpkin-mc/.bench-targets/master/release/pumpkin",
+    "cache_enabled": false,
+    "capacity_mib": 0
+  },
+  {
+    "name": "stack-disabled",
+    "binary": "/home/Jamie/Documents/pumpkin-mc/.bench-targets/stack/release/pumpkin",
+    "cache_enabled": false,
+    "capacity_mib": 0
+  },
+  {
+    "name": "stack-enabled",
+    "binary": "/home/Jamie/Documents/pumpkin-mc/.bench-targets/stack/release/pumpkin",
+    "cache_enabled": true,
+    "capacity_mib": 64
+  }
+]
