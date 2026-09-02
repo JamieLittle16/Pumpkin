@@ -72,20 +72,15 @@ pub fn set_block_light(cache: &mut Cache, pos: BlockPos, level: u8) {
 
     match &mut cache.chunks[idx] {
         Chunk::Level(c) => {
-            let marked_dirty = {
-                let mut light_engine = c
-                    .light_engine
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                if section_y < light_engine.block_light.len() {
-                    light_engine.block_light[section_y].set(x, y, z, level);
-                    true
-                } else {
-                    false
-                }
-            };
-            if marked_dirty {
+            let mut mutation = c.begin_network_mutation();
+            let mut light_engine = c
+                .light_engine
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if section_y < light_engine.block_light.len() {
+                light_engine.block_light[section_y].set(x, y, z, level);
                 c.dirty.store(true, std::sync::atomic::Ordering::Relaxed);
+                mutation.mark_changed();
             }
         }
         Chunk::Proto(c) => {
@@ -147,20 +142,15 @@ pub fn set_sky_light(cache: &mut Cache, pos: BlockPos, level: u8) {
 
     match &mut cache.chunks[idx] {
         Chunk::Level(c) => {
-            let marked_dirty = {
-                let mut light_engine = c
-                    .light_engine
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                if section_y < light_engine.sky_light.len() {
-                    light_engine.sky_light[section_y].set(x, y, z, level);
-                    true
-                } else {
-                    false
-                }
-            };
-            if marked_dirty {
+            let mut mutation = c.begin_network_mutation();
+            let mut light_engine = c
+                .light_engine
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if section_y < light_engine.sky_light.len() {
+                light_engine.sky_light[section_y].set(x, y, z, level);
                 c.dirty.store(true, std::sync::atomic::Ordering::Relaxed);
+                mutation.mark_changed();
             }
         }
         Chunk::Proto(c) => {

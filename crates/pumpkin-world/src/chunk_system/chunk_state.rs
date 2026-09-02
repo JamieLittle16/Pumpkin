@@ -265,6 +265,9 @@ impl Chunk {
         let proto_chunk_box = match std::mem::replace(
             self,
             Self::Level(Arc::new(ChunkData {
+                instance_id: ChunkData::next_instance_id(),
+                network_state_gate: std::sync::RwLock::new(()),
+                network_revision: AtomicU64::new(0),
                 section: ChunkSections::new(0, 0),
                 heightmap: Mutex::default(),
                 x: 0,
@@ -313,6 +316,9 @@ impl Chunk {
         }
 
         let chunk = ChunkData {
+            instance_id: ChunkData::next_instance_id(),
+            network_state_gate: std::sync::RwLock::new(()),
+            network_revision: AtomicU64::new(0),
             light_engine: Mutex::new(light_data),
             light_populated: AtomicBool::new(is_lit),
             section: sections,

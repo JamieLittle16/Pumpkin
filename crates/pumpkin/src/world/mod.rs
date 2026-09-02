@@ -2746,8 +2746,9 @@ impl World {
                 return;
             }
         }
+        let snapshot = chunk.network_snapshot();
         client.send_packet_now(&CChunkBatchStart).await;
-        client.send_packet_now(&CChunkData(&chunk)).await;
+        client.send_packet_now(&CChunkData(&snapshot)).await;
         client.send_packet_now(&CChunkBatchEnd::new(1u16)).await;
 
         let velocity = player.living_entity.entity.velocity.load();
@@ -3662,8 +3663,9 @@ impl World {
                 .level
                 .get_or_fetch_chunk(center_chunk, std::clone::Clone::clone)
                 .await;
+            let snapshot = chunk.network_snapshot();
             java_client.send_packet_now(&CChunkBatchStart).await;
-            java_client.send_packet_now(&CChunkData(&chunk)).await;
+            java_client.send_packet_now(&CChunkData(&snapshot)).await;
             java_client
                 .send_packet_now(&CChunkBatchEnd::new(1u16))
                 .await;
@@ -5281,6 +5283,19 @@ impl World {
         let chunk_pos = block_pos.chunk_position();
         let packet_nbt = block_entity.packet_nbt();
 
+        let canonical =
+            Self::canonical_block_entity_record(block_entity.as_ref(), packet_nbt.clone());
+        let instance_id = canonical.instance_id;
+        self.level.read_chunk_sync(&chunk_pos, |chunk| {
+            let mut mutation = chunk.begin_network_mutation();
+            chunk
+                .block_entities
+                .lock()
+                .unwrap()
+                .insert(block_pos, canonical.clone());
+            chunk.mark_dirty(true);
+            mutation.mark_changed();
+        });
         if let Some(nbt) = packet_nbt
             .as_ref()
             .and_then(|packet| packet.update.as_ref())
@@ -5295,17 +5310,6 @@ impl World {
                 ),
             );
         }
-
-        let canonical = Self::canonical_block_entity_record(block_entity.as_ref(), packet_nbt);
-        let instance_id = canonical.instance_id;
-        self.level.read_chunk_sync(&chunk_pos, |chunk| {
-            chunk
-                .block_entities
-                .lock()
-                .unwrap()
-                .insert(block_pos, canonical.clone());
-            chunk.mark_dirty(true);
-        });
         self.block_entities.entry(chunk_pos).or_default().insert(
             block_pos,
             RuntimeBlockEntityEntry {
@@ -5318,12 +5322,14 @@ impl World {
     pub(crate) fn add_block_entity_nbt(&self, block_pos: BlockPos, nbt: &NbtCompound) {
         self.level
             .read_chunk_sync(&block_pos.chunk_position(), |chunk| {
+                let mut mutation = chunk.begin_network_mutation();
                 chunk
                     .block_entities
                     .lock()
                     .unwrap()
                     .insert(block_pos, CanonicalBlockEntityNbt::new(nbt.clone()));
                 chunk.mark_dirty(true);
+                mutation.mark_changed();
             });
     }
 
@@ -5336,6 +5342,7 @@ impl World {
                     chunk_block_entities.remove(block_pos).is_some()
                 });
         self.level.read_chunk_sync(&chunk_pos, |chunk| {
+            let mut mutation = chunk.begin_network_mutation();
             let removed = chunk
                 .block_entities
                 .lock()
@@ -5344,6 +5351,7 @@ impl World {
                 .is_some();
             if removed {
                 chunk.mark_dirty(true);
+                mutation.mark_changed();
             }
             removed
         });
@@ -5403,6 +5411,7 @@ impl World {
         let committed = self
             .level
             .read_chunk_sync(&chunk_pos, |chunk| {
+                let mut mutation = chunk.begin_network_mutation();
                 let mut records = chunk.block_entities.lock().unwrap();
                 let Some(record) = records.get_mut(&block_pos) else {
                     return false;
@@ -5421,6 +5430,7 @@ impl World {
                 );
                 if result.is_committed() {
                     chunk.mark_dirty(true);
+                    mutation.mark_changed();
                     true
                 } else {
                     false
@@ -5877,6 +5887,7 @@ impl WorldPortalExt for WorldPortal {
         });
     }
 }
+
 #[cfg(test)]
 mod block_entity_persistence_tests {
     use super::*;

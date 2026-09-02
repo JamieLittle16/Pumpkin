@@ -319,13 +319,14 @@ impl JavaClient {
                 continue;
             }
 
+            let snapshot = chunk.network_snapshot();
             let mut buf = Vec::new();
             let version = self.version.load();
             if let Err(err) = buf.write_var_int(&VarInt(CChunkData::to_id(version))) {
                 error!("Failed to write chunk data id: {err:?}");
                 continue;
             }
-            if let Err(err) = CChunkData(chunk).write_packet_data(&mut buf, &version) {
+            if let Err(err) = CChunkData(&snapshot).write_packet_data(&mut buf, &version) {
                 error!("Failed to write chunk data: {err:?}");
                 continue;
             }
