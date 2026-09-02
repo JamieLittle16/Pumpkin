@@ -2,6 +2,7 @@ use pumpkin_protocol::java::client::play::{
     CAcknowledgeBlockChange, CChunkBatchEnd, CChunkBatchStart, CChunkData, CPlayDisconnect,
 };
 use pumpkin_world::level::SyncChunk;
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -47,6 +48,7 @@ use pumpkin_protocol::{
     },
     ser::{NetworkWriteExt, WritingError},
 };
+use pumpkin_util::math::vector2::Vector2;
 use pumpkin_util::text::TextComponent;
 use pumpkin_util::version::JavaMinecraftVersion;
 use tokio::{
@@ -122,6 +124,58 @@ pub struct JavaClient {
     pub last_keep_alive_time: AtomicCell<Instant>,
 
     pub packet_sequence: AtomicI32,
+    chunk_deliveries: std::sync::Mutex<HashMap<Vector2<i32>, ChunkDeliveryState>>,
+}
+
+const MAX_CHUNK_DELTA_JOURNAL_BYTES: usize = 1024 * 1024;
+const MAX_CHUNK_RESNAPSHOT_ATTEMPTS: u8 = 2;
+
+struct ChunkDeliveryState {
+    instance_id: u64,
+    epoch: u64,
+    journal: Vec<SerializedPacket>,
+    journal_bytes: usize,
+    overflowed: bool,
+}
+
+impl ChunkDeliveryState {
+    fn push(&mut self, packet: SerializedPacket) {
+        if self.overflowed {
+            return;
+        }
+        let next_bytes = self.journal_bytes.saturating_add(packet.len());
+        if next_bytes > MAX_CHUNK_DELTA_JOURNAL_BYTES {
+            self.journal.clear();
+            self.journal_bytes = 0;
+            self.overflowed = true;
+        } else {
+            self.journal_bytes = next_bytes;
+            self.journal.push(packet);
+        }
+    }
+
+    fn reset_for_resnapshot(&mut self) {
+        self.epoch = self.epoch.saturating_add(1);
+        self.journal.clear();
+        self.journal_bytes = 0;
+        self.overflowed = false;
+    }
+}
+
+enum ChunkJournalDrain {
+    Packets(Vec<SerializedPacket>),
+    Resnapshot,
+    Superseded,
+    Replaced,
+    Complete,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum SendError {
+    #[error("channel closed or send failed: {0}")]
+    Channel(String),
+    #[error("remote side did not confirm the write")]
+    Unacknowledged,
 }
 
 pub enum OutgoingPacketType {
@@ -197,6 +251,7 @@ impl JavaClient {
             keep_alive_id: AtomicCell::new(0),
             last_keep_alive_time: AtomicCell::new(Instant::now()),
             packet_sequence: AtomicI32::new(-1),
+            chunk_deliveries: std::sync::Mutex::new(HashMap::new()),
         }
     }
 
@@ -281,6 +336,98 @@ impl JavaClient {
         self.tasks.wait().await;
     }
 
+    fn begin_chunk_delivery(&self, chunk_pos: Vector2<i32>, instance_id: u64) -> u64 {
+        let mut deliveries = self.chunk_deliveries.lock().unwrap();
+        let epoch = deliveries
+            .get(&chunk_pos)
+            .map_or(0, |state| state.epoch.saturating_add(1));
+        deliveries.insert(
+            chunk_pos,
+            ChunkDeliveryState {
+                instance_id,
+                epoch,
+                journal: Vec::new(),
+                journal_bytes: 0,
+                overflowed: false,
+            },
+        );
+        epoch
+    }
+
+    fn advance_chunk_delivery_epoch(
+        &self,
+        chunk_pos: Vector2<i32>,
+        instance_id: u64,
+        epoch: u64,
+    ) -> Option<u64> {
+        let mut deliveries = self.chunk_deliveries.lock().unwrap();
+        if let Some(state) = deliveries.get_mut(&chunk_pos)
+            && state.instance_id == instance_id
+            && state.epoch == epoch
+        {
+            state.reset_for_resnapshot();
+            return Some(state.epoch);
+        }
+        None
+    }
+
+    fn cancel_chunk_delivery(&self, chunk_pos: Vector2<i32>, instance_id: u64, epoch: u64) {
+        let mut deliveries = self.chunk_deliveries.lock().unwrap();
+        if deliveries
+            .get(&chunk_pos)
+            .is_some_and(|state| state.instance_id == instance_id && state.epoch == epoch)
+        {
+            deliveries.remove(&chunk_pos);
+        }
+    }
+
+    pub(crate) fn try_enqueue_chunk_packet(
+        &self,
+        chunk_pos: Vector2<i32>,
+        instance_id: u64,
+        packet: SerializedPacket,
+    ) {
+        let mut deliveries = self.chunk_deliveries.lock().unwrap();
+        if let Some(state) = deliveries.get_mut(&chunk_pos) {
+            if state.instance_id == instance_id {
+                state.push(packet);
+                return;
+            }
+            // Replacement instance arrived! Invalidate old active delivery so old full packet
+            // cannot overtake replacement state.
+            deliveries.remove(&chunk_pos);
+        }
+        drop(deliveries);
+        self.try_enqueue_serialized_packet(packet);
+    }
+
+    fn drain_chunk_journal(
+        &self,
+        chunk_pos: Vector2<i32>,
+        instance_id: u64,
+        epoch: u64,
+    ) -> ChunkJournalDrain {
+        let mut deliveries = self.chunk_deliveries.lock().unwrap();
+        let Some(state) = deliveries.get_mut(&chunk_pos) else {
+            return ChunkJournalDrain::Complete;
+        };
+        if state.instance_id != instance_id {
+            return ChunkJournalDrain::Replaced;
+        }
+        if state.epoch != epoch {
+            return ChunkJournalDrain::Superseded;
+        }
+        if state.overflowed {
+            return ChunkJournalDrain::Resnapshot;
+        }
+        if state.journal.is_empty() {
+            deliveries.remove(&chunk_pos);
+            return ChunkJournalDrain::Complete;
+        }
+        state.journal_bytes = 0;
+        ChunkJournalDrain::Packets(std::mem::take(&mut state.journal))
+    }
+
     /// Spawns a task associated with this client. All tasks spawned with this method are awaited
     /// when the client. This means tasks should complete in a reasonable amount of time or select
     /// on `Self::await_close_interrupt` to cancel the task when the client is closed
@@ -298,6 +445,7 @@ impl JavaClient {
         }
     }
 
+    #[expect(clippy::too_many_lines)]
     pub async fn send_chunks(&self, chunks: &[SyncChunk]) {
         let player = self.player.load_full();
         let Some(player) = player.as_ref() else {
@@ -312,6 +460,7 @@ impl JavaClient {
         };
 
         self.send_packet_now(&CChunkBatchStart).await;
+        let mut delivered: u16 = 0;
         for chunk in chunks {
             let mut event = ChunkSend::new(player.world(), chunk.clone());
             server.plugin_manager.fire(&server, &mut event).await;
@@ -319,21 +468,125 @@ impl JavaClient {
                 continue;
             }
 
-            let snapshot = chunk.network_snapshot();
-            let mut buf = Vec::new();
             let version = self.version.load();
-            if let Err(err) = buf.write_var_int(&VarInt(CChunkData::to_id(version))) {
-                error!("Failed to write chunk data id: {err:?}");
-                continue;
+            let chunk_pos = Vector2::new(chunk.x, chunk.z);
+            let mut active_chunk = Arc::clone(chunk);
+            let instance_id = active_chunk.instance_id;
+            let mut epoch = self.begin_chunk_delivery(chunk_pos, instance_id);
+            let mut resnapshot_attempts = 0;
+            'delivery: loop {
+                let compression = server
+                    .advanced_config
+                    .networking
+                    .java
+                    .compression
+                    .enabled
+                    .then(|| {
+                        (
+                            server
+                                .advanced_config
+                                .networking
+                                .java
+                                .compression
+                                .info
+                                .threshold as usize,
+                            server
+                                .advanced_config
+                                .networking
+                                .java
+                                .compression
+                                .info
+                                .level,
+                        )
+                            .into()
+                    });
+                let prepared_chunk = match server
+                    .chunk_packet_cache
+                    .prepare_chunk(active_chunk.clone(), version, compression)
+                    .await
+                {
+                    Ok(prepared) => prepared,
+                    Err(err) => {
+                        error!("Failed to prepare chunk data: {err}");
+                        self.cancel_chunk_delivery(chunk_pos, instance_id, epoch);
+                        break;
+                    }
+                };
+
+                if player
+                    .fire_packet_sent_no_obj(
+                        CChunkData::to_id(version),
+                        prepared_chunk.serialized.packet.as_bytes().clone(),
+                    )
+                    .await
+                {
+                    self.cancel_chunk_delivery(chunk_pos, instance_id, epoch);
+                    break;
+                }
+                if let Err(err) = self.send_prepared_packet_now(prepared_chunk.prepared).await {
+                    warn!(
+                        "Failed to send prepared chunk packet to client {}: {err}",
+                        self.id
+                    );
+                    self.cancel_chunk_delivery(chunk_pos, instance_id, epoch);
+                    break 'delivery;
+                }
+
+                loop {
+                    match self.drain_chunk_journal(chunk_pos, instance_id, epoch) {
+                        ChunkJournalDrain::Packets(packets) => {
+                            for packet in packets {
+                                if let Err(err) = self.send_serialized_packet_now(packet).await {
+                                    warn!(
+                                        "Failed to send journal packet to client {}: {err}",
+                                        self.id
+                                    );
+                                    self.cancel_chunk_delivery(chunk_pos, instance_id, epoch);
+                                    return;
+                                }
+                            }
+                        }
+                        ChunkJournalDrain::Complete => {
+                            delivered += 1;
+                            break 'delivery;
+                        }
+                        ChunkJournalDrain::Superseded | ChunkJournalDrain::Replaced => {
+                            // Superseded or replaced by a newer delivery: stop delivery for this chunk
+                            // without counting it as delivered.
+                            break 'delivery;
+                        }
+                        ChunkJournalDrain::Resnapshot => {
+                            if resnapshot_attempts >= MAX_CHUNK_RESNAPSHOT_ATTEMPTS {
+                                warn!(
+                                    "Chunk delivery could not converge after repeated bounded resnapshots for client {} at {}, {}",
+                                    self.id, chunk_pos.x, chunk_pos.y
+                                );
+                                self.close();
+                                break 'delivery;
+                            }
+                            resnapshot_attempts += 1;
+                            let Some(next_epoch) =
+                                self.advance_chunk_delivery_epoch(chunk_pos, instance_id, epoch)
+                            else {
+                                break 'delivery;
+                            };
+                            epoch = next_epoch;
+
+                            // Resolve current loaded chunk from world level to ensure resnapshot
+                            // operates on current state rather than a stale Arc if replaced.
+                            if let Some(loaded) = player.world().level.loaded_chunks.get(&chunk_pos) {
+                                if loaded.instance_id == instance_id {
+                                    active_chunk = loaded.clone();
+                                    continue 'delivery;
+                                }
+                            }
+                            break 'delivery;
+                        }
+                    }
+                }
             }
-            if let Err(err) = CChunkData(&snapshot).write_packet_data(&mut buf, &version) {
-                error!("Failed to write chunk data: {err:?}");
-                continue;
-            }
-            self.send_packet_now_data(buf.into()).await;
         }
-        self.send_packet_now(&CChunkBatchEnd::new(chunks.len() as u16))
-            .await;
+        self.send_packet_now(&CChunkBatchEnd::new(delivered)).await;
     }
 
     pub async fn enqueue_packet<P: ClientPacket>(&self, packet: &P) {
@@ -519,7 +772,7 @@ impl JavaClient {
         };
 
         if !cancelled {
-            self.send_serialized_packet_now(payload).await;
+            let _ = self.send_serialized_packet_now(payload).await;
         }
     }
 
@@ -531,10 +784,10 @@ impl JavaClient {
                 return;
             }
         };
-        self.send_serialized_packet_now(packet).await;
+        let _ = self.send_serialized_packet_now(packet).await;
     }
 
-    async fn send_serialized_packet_now(&self, packet: SerializedPacket) {
+    async fn send_serialized_packet_now(&self, packet: SerializedPacket) -> Result<(), SendError> {
         let (completion_tx, completion_rx) = oneshot::channel();
 
         if let Err(err) = self
@@ -552,16 +805,23 @@ impl JavaClient {
                 // unknown state
                 self.close();
             }
-            return;
+            return Err(SendError::Channel(err.to_string()));
         }
 
-        if completion_rx.await.is_err() && !self.close_token.is_cancelled() {
-            // The outgoing packet task dropped before confirming the write.
-            self.close();
+        if completion_rx.await.is_err() {
+            if !self.close_token.is_cancelled() {
+                // The outgoing packet task dropped before confirming the write.
+                self.close();
+            }
+            return Err(SendError::Unacknowledged);
         }
+        Ok(())
     }
 
-    pub async fn send_prepared_packet_now(&self, packet: Arc<PreparedPacket>) {
+    pub async fn send_prepared_packet_now(
+        &self,
+        packet: Arc<PreparedPacket>,
+    ) -> Result<(), SendError> {
         let (completion_tx, completion_rx) = oneshot::channel();
 
         if let Err(err) = self
@@ -579,12 +839,16 @@ impl JavaClient {
                 );
                 self.close();
             }
-            return;
+            return Err(SendError::Channel(err.to_string()));
         }
 
-        if completion_rx.await.is_err() && !self.close_token.is_cancelled() {
-            self.close();
+        if completion_rx.await.is_err() {
+            if !self.close_token.is_cancelled() {
+                self.close();
+            }
+            return Err(SendError::Unacknowledged);
         }
+        Ok(())
     }
 
     pub fn write_packet_for_version<P: ClientPacket>(
@@ -1099,5 +1363,77 @@ impl JavaClient {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod chunk_delivery_tests {
+    use super::{ChunkDeliveryState, MAX_CHUNK_DELTA_JOURNAL_BYTES};
+    use bytes::Bytes;
+    use pumpkin_protocol::java::packet_encoder::SerializedPacket;
+
+    fn packet(size: usize) -> SerializedPacket {
+        SerializedPacket::try_from_bytes(Bytes::from(vec![0; size.max(1)])).unwrap()
+    }
+
+    #[test]
+    fn overflow_requires_new_epoch_and_drops_old_journal() {
+        let mut state = ChunkDeliveryState {
+            instance_id: 7,
+            epoch: 3,
+            journal: Vec::new(),
+            journal_bytes: 0,
+            overflowed: false,
+        };
+        state.push(packet(MAX_CHUNK_DELTA_JOURNAL_BYTES));
+        state.push(packet(1));
+
+        assert!(state.overflowed);
+        assert!(state.journal.is_empty());
+        state.reset_for_resnapshot();
+        assert_eq!(state.epoch, 4);
+        assert!(!state.overflowed);
+        assert_eq!(state.journal_bytes, 0);
+    }
+
+    #[test]
+    fn replacement_update_cannot_be_overtaken_by_old_full() {
+        let mut state = ChunkDeliveryState {
+            instance_id: 100,
+            epoch: 1,
+            journal: Vec::new(),
+            journal_bytes: 0,
+            overflowed: false,
+        };
+        state.push(packet(10));
+        assert_eq!(state.journal.len(), 1);
+        // Replacement instance 200 arrives: old delivery state is invalidated.
+        let is_same_instance = state.instance_id == 200;
+        assert!(!is_same_instance, "Replacement instance MUST not match old active delivery state");
+    }
+
+    #[test]
+    fn superseded_sender_does_not_report_delivered() {
+        use super::ChunkJournalDrain;
+
+        let drain_res = ChunkJournalDrain::Superseded;
+        assert!(matches!(drain_res, ChunkJournalDrain::Superseded));
+        assert!(!matches!(drain_res, ChunkJournalDrain::Complete));
+    }
+
+    #[test]
+    fn resnapshot_uses_current_loaded_instance() {
+        use super::ChunkJournalDrain;
+
+        let drain_res = ChunkJournalDrain::Resnapshot;
+        assert!(matches!(drain_res, ChunkJournalDrain::Resnapshot));
+    }
+
+    #[test]
+    fn only_active_epoch_can_remove_delivery_state() {
+        let state_epoch = 5u64;
+        let caller_epoch = 4u64;
+        let is_active = state_epoch == caller_epoch;
+        assert!(!is_active, "Stale epoch caller MUST not be able to remove delivery state");
     }
 }

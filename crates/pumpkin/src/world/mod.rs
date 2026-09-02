@@ -543,6 +543,41 @@ impl World {
         }
     }
 
+    fn broadcast_java_grouped_to_chunk<P: ClientPacket>(
+        chunk_pos: Vector2<i32>,
+        chunk_instance_id: u64,
+        packet: &P,
+        recipients_by_version: BTreeMap<JavaMinecraftVersion, Vec<&JavaClient>>,
+    ) {
+        for (version, recipients) in recipients_by_version {
+            let packet_data = match JavaClient::serialize_packet_for_version(packet, version) {
+                Ok(packet_data) => packet_data,
+                Err(err) => {
+                    error!(
+                        "Failed to serialize chunk update {} for version {:?}: {}",
+                        std::any::type_name::<P>(),
+                        version,
+                        err
+                    );
+                    continue;
+                }
+            };
+            for recipient in recipients {
+                recipient.try_enqueue_chunk_packet(
+                    chunk_pos,
+                    chunk_instance_id,
+                    packet_data.clone(),
+                );
+            }
+        }
+    }
+
+    fn chunk_instance_id(&self, chunk_pos: Vector2<i32>) -> u64 {
+        self.level
+            .read_chunk_sync(&chunk_pos, |chunk| chunk.instance_id)
+            .unwrap_or(0)
+    }
+
     /// Broadcasts a packet to all connected players within the world.
     /// Please avoid this as we want to replace it with `broadcast_editioned`
     ///
@@ -1144,7 +1179,9 @@ impl World {
 
                 let recipients_by_version =
                     Self::collect_java_recipients_by_version(java_recipients.into_iter());
-                Self::broadcast_java_grouped(
+                Self::broadcast_java_grouped_to_chunk(
+                    chunk_pos,
+                    self.chunk_instance_id(chunk_pos),
                     &CMultiBlockUpdate::new(&updates),
                     recipients_by_version,
                 );
@@ -5697,7 +5734,12 @@ impl World {
         });
 
         let recipients_by_version = Self::collect_java_recipients_by_version(recipients);
-        Self::broadcast_java_grouped(packet, recipients_by_version);
+        Self::broadcast_java_grouped_to_chunk(
+            chunk_pos,
+            self.chunk_instance_id(chunk_pos),
+            packet,
+            recipients_by_version,
+        );
     }
 
     pub fn broadcast_to_chunk_editioned_sync<J: ClientPacket, B: BClientPacket>(
@@ -5724,7 +5766,12 @@ impl World {
 
         let recipients_by_version =
             Self::collect_java_recipients_by_version(java_recipients.into_iter());
-        Self::broadcast_java_grouped(je_packet, recipients_by_version);
+        Self::broadcast_java_grouped_to_chunk(
+            chunk_pos,
+            self.chunk_instance_id(chunk_pos),
+            je_packet,
+            recipients_by_version,
+        );
     }
 
     /// Broadcasts a packet to chunk watchers, excluding specific players.
@@ -5747,7 +5794,12 @@ impl World {
         });
 
         let recipients_by_version = Self::collect_java_recipients_by_version(recipients);
-        Self::broadcast_java_grouped(packet, recipients_by_version);
+        Self::broadcast_java_grouped_to_chunk(
+            chunk_pos,
+            self.chunk_instance_id(chunk_pos),
+            packet,
+            recipients_by_version,
+        );
     }
 
     pub async fn broadcast_to_chunk_except_editioned<J: ClientPacket, B: BClientPacket>(
@@ -5780,7 +5832,12 @@ impl World {
 
         let je_recipients_by_version =
             Self::collect_java_recipients_by_version(java_recipients.into_iter());
-        Self::broadcast_java_grouped(je_packet, je_recipients_by_version);
+        Self::broadcast_java_grouped_to_chunk(
+            chunk_pos,
+            self.chunk_instance_id(chunk_pos),
+            je_packet,
+            je_recipients_by_version,
+        );
 
         for recipient in bedrock_recipients {
             recipient.enqueue_packet(be_packet).await;
