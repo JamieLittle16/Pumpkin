@@ -1,0 +1,42 @@
+name: Closeout rebase 2792
+
+on:
+  push:
+    branches:
+      - automation/rebase-2792
+
+permissions:
+  contents: write
+
+jobs:
+  rebase-pr1:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: true
+      - name: Rebase prepared packet foundation
+        shell: bash
+        run: |
+          set -euxo pipefail
+          git config user.name "JamieLittle16"
+          git config user.email "160879046+JamieLittle16@users.noreply.github.com"
+          git remote add upstream https://github.com/Pumpkin-MC/Pumpkin.git || true
+          git fetch upstream master
+          git fetch origin archive/2792-pr1-pre-rebase
+
+          git switch --detach origin/archive/2792-pr1-pre-rebase
+          if ! GIT_EDITOR=true git rebase --onto upstream/master 7e2505b05583015f5346da6fb52091ce5cb234f2; then
+            echo '=== REBASE CONFLICT ==='
+            git status --short
+            git diff --check || true
+            git diff || true
+            exit 1
+          fi
+
+          cargo fmt --all
+          git add -A
+          git diff --cached --check || true
+          cargo check -p pumpkin-protocol -p pumpkin --all-targets
+          git push --force origin HEAD:pr1-rebuild
