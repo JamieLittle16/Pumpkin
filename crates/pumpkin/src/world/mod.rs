@@ -5981,6 +5981,7 @@ mod block_entity_persistence_tests {
             0,
             Dimension::OVERWORLD,
             None,
+            None,
         );
         let level_info = Arc::new(ArcSwap::new(Arc::new(LevelData::default(Seed(0)))));
         let world = Arc::new(World::load(

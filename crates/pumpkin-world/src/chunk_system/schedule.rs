@@ -13,6 +13,7 @@ use crate::level::{Level, SyncChunk};
 use dashmap::DashMap;
 use pumpkin_config::lighting::LightingEngineConfig;
 use pumpkin_data::chunk_gen_settings::GenerationSettings;
+use pumpkin_util::background_cpu::{BackgroundCpuBudget, BackgroundCpuCategory};
 use pumpkin_util::math::vector2::Vector2;
 use slotmap::Key;
 use std::cmp::{Ordering, max};
@@ -75,12 +76,14 @@ pub struct GenerationSchedule {
     generate: crossfire::compat::MTx<(ChunkPos, Cache, StagedChunkEnum)>,
     send_chunk: crossfire::compat::MTx<(ChunkPos, RecvChunk)>,
     gen_pool: Option<Arc<rayon::ThreadPool>>,
+    background_cpu_budget: Option<Arc<BackgroundCpuBudget>>,
     listener: Arc<ChunkListener>,
     lighting_config: LightingEngineConfig,
     last_unload: std::time::Instant,
 }
 
 impl GenerationSchedule {
+    #[expect(clippy::too_many_arguments)]
     pub fn create(
         io_read_thread_count: usize,
         gen_thread_count: usize,
@@ -89,6 +92,7 @@ impl GenerationSchedule {
         listener: Arc<ChunkListener>,
         thread_tracker: &mut Vec<thread::JoinHandle<()>>,
         gen_pool: Option<Arc<rayon::ThreadPool>>,
+        background_cpu_budget: Option<Arc<BackgroundCpuBudget>>,
     ) {
         let (send_chunk, recv_chunk) = crossfire::compat::mpmc::unbounded_blocking();
 
@@ -167,6 +171,7 @@ impl GenerationSchedule {
                     generate: send_gen,
                     send_chunk,
                     gen_pool,
+                    background_cpu_budget,
                     listener,
                     chunk_map: HashMap::default(),
                     lighting_config,
@@ -1307,8 +1312,12 @@ impl GenerationSchedule {
                             let level = level.clone();
                             let settings =
                                 GenerationSettings::from_dimension(level.world_gen.dimension());
+                            let budget = self.background_cpu_budget.clone();
 
                             pool.spawn(move || {
+                                let _permit = budget.as_deref().map(|budget| {
+                                    budget.acquire(BackgroundCpuCategory::Generation)
+                                });
                                 let result = crate::chunk_system::worker_logic::run_generation(
                                     pos, cache, stage, &level, settings,
                                 );

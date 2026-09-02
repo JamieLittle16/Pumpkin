@@ -2,6 +2,7 @@ use std::{path::PathBuf, sync::Arc};
 
 use pumpkin_config::world::LevelConfig;
 use pumpkin_data::dimension::Dimension;
+use pumpkin_util::background_cpu::BackgroundCpuBudget;
 
 use crate::level::Level;
 
@@ -12,6 +13,7 @@ pub fn into_level(
     mut base_directory: PathBuf,
     seed: i64,
     gen_pool: Option<Arc<rayon::ThreadPool>>,
+    background_cpu_budget: Option<Arc<BackgroundCpuBudget>>,
 ) -> Arc<Level> {
     if dimension.minecraft_name == Dimension::OVERWORLD.minecraft_name {
     } else if dimension.minecraft_name == Dimension::THE_NETHER.minecraft_name {
@@ -19,5 +21,12 @@ pub fn into_level(
     } else if dimension.minecraft_name == Dimension::THE_END.minecraft_name {
         base_directory.push("DIM1");
     }
-    Level::from_root_folder(level_config, base_directory, seed, dimension, gen_pool)
+    Level::from_root_folder(
+        level_config,
+        base_directory,
+        seed,
+        dimension,
+        gen_pool,
+        background_cpu_budget,
+    )
 }

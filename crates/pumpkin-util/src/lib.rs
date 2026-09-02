@@ -10,6 +10,7 @@ pub use permission::PermissionLvl;
 
 use crate::{math::vector3::Axis, random::RandomImpl};
 
+pub mod background_cpu;
 pub mod biome;
 pub mod chest_loot_table;
 pub mod difficulty;

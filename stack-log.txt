@@ -1,0 +1,11 @@
+* 349a9f800 (HEAD -> pr6-rebuild) style: format code and clean clippy expectations
+* 25e776a12 bench(chunk-packet-cache): add benchmark harness and metrics
+* 140d941b2 (pr5-rebuild) fix(net): add replacement-aware and epoch-aware chunk delivery with resnapshot resolution
+* b8994a15f perf(net): deliver cached chunks with resnapshot journal
+* 71c71ad15 (pr4-rebuild) fix(server): silence unused variable warning in test
+* 6180d799b fix(server): qualify AtomicUsize Ordering in test
+* 4f69fca83 fix(server): make in-flight metrics test deterministic
+* c365b69a7 perf(net): add two-tier chunk packet cache
+* fc21685e4 (pr3-rebuild) refactor(world): add coherent chunk network snapshots
+* ac986041b (pr2-rebuild) refactor(world): add canonical block entity state
+* a2225f60f (pr1-rebuild) perf(protocol): add typed prepared packets

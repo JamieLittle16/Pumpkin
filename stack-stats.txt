@@ -1,0 +1,43 @@
+a2225f60f perf(protocol): add typed prepared packets
+ pumpkin-protocol/fuzz/fuzz_targets/encoder_java.rs |  10 +-
+ pumpkin-protocol/src/java/packet_encoder.rs        | 381 ++++++++++++++++++++-
+ pumpkin/src/net/java/mod.rs                        | 134 +++++++-
+ pumpkin/src/world/mod.rs                           |   4 +-
+ 4 files changed, 493 insertions(+), 36 deletions(-)
+ac986041b refactor(world): add canonical block entity state
+ .../src/java/client/play/chunk_data.rs             |   15 +-
+ pumpkin-world/src/chunk/format/mod.rs              |   16 +-
+ pumpkin-world/src/chunk/mod.rs                     |  183 +++-
+ pumpkin-world/src/chunk_system/chunk_state.rs      |   12 +-
+ .../src/block/entities/chest_like_block_entity.rs  |    4 +
+ pumpkin/src/block/entities/command_block.rs        |    2 +-
+ .../block/entities/furnace_like_block_entity.rs    |    8 +
+ pumpkin/src/block/entities/jigsaw_block.rs         |    2 +-
+ pumpkin/src/block/entities/jukebox.rs              |    8 +
+ pumpkin/src/block/entities/mod.rs                  |   36 +-
+ .../loader/wasm/wasm_host/wit/v0_1/events/world.rs |   12 +-
+ pumpkin/src/world/mod.rs                           | 1119 +++++++++++++++++++-
+ 12 files changed, 1332 insertions(+), 85 deletions(-)
+fc21685e4 refactor(world): add coherent chunk network snapshots
+ .../src/java/client/play/chunk_data.rs             |  37 +---
+ pumpkin-world/src/chunk/format/mod.rs              |   3 +
+ pumpkin-world/src/chunk/mod.rs                     | 227 ++++++++++++++++++++-
+ pumpkin-world/src/chunk_system/chunk_state.rs      |   6 +
+ pumpkin-world/src/chunk_system/schedule.rs         |   4 +
+ pumpkin-world/src/lighting/runtime.rs              |   4 +
+ pumpkin-world/src/lighting/storage.rs              |   4 +
+ pumpkin/src/command/commands/fillbiome.rs          |   7 +-
+ pumpkin/src/net/java/mod.rs                        |   3 +-
+ .../loader/wasm/wasm_host/wit/v0_1/events/world.rs |   9 +
+ pumpkin/src/world/mod.rs                           |  37 ++--
+ 11 files changed, 296 insertions(+), 45 deletions(-)
+71c71ad15 fix(server): silence unused variable warning in test
+ pumpkin/src/server/chunk_packet_cache.rs | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+140d941b2 fix(net): add replacement-aware and epoch-aware chunk delivery with resnapshot resolution
+ pumpkin/src/net/java/mod.rs | 84 +++++++++++++++++++++++++++++++++++++++------
+ 1 file changed, 74 insertions(+), 10 deletions(-)
+349a9f800 style: format code and clean clippy expectations
+ pumpkin/src/net/java/mod.rs | 20 +++++++++++++-------
+ pumpkin/src/world/mod.rs    | 15 +++++++--------
+ 2 files changed, 20 insertions(+), 15 deletions(-)

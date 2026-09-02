@@ -23,6 +23,7 @@ use pumpkin_config::{chunk::ChunkConfig, lighting::LightingEngineConfig, world::
 use pumpkin_data::biome::Biome;
 use pumpkin_data::dimension::Dimension;
 use pumpkin_data::{Block, BlockStateId, block_properties::has_random_ticks, fluid::Fluid};
+use pumpkin_util::background_cpu::{BackgroundCpuBudget, BackgroundCpuCategory};
 use pumpkin_util::math::{position::BlockPos, vector2::Vector2};
 use pumpkin_util::world_seed::Seed;
 use rustc_hash::FxHashSet;
@@ -115,6 +116,7 @@ pub struct Level {
     pub thread_tracker: Mutex<Vec<thread::JoinHandle<()>>>,
     pub chunk_listener: Arc<ChunkListener>,
     pub gen_pool: Option<Arc<rayon::ThreadPool>>,
+    pub background_cpu_budget: Option<Arc<BackgroundCpuBudget>>,
 }
 
 pub struct TickData {
@@ -147,6 +149,7 @@ impl Level {
         seed: i64,
         dimension: Dimension,
         gen_pool: Option<Arc<rayon::ThreadPool>>,
+        background_cpu_budget: Option<Arc<BackgroundCpuBudget>>,
     ) -> Arc<Self> {
         let dim_folder = if dimension.minecraft_name == Dimension::OVERWORLD.minecraft_name
             || dimension.minecraft_name == Dimension::THE_NETHER.minecraft_name
@@ -276,6 +279,7 @@ impl Level {
             thread_tracker,
             chunk_listener: listener.clone(),
             gen_pool: gen_pool.clone(),
+            background_cpu_budget: background_cpu_budget.clone(),
         });
 
         // TODO
@@ -293,6 +297,7 @@ impl Level {
             listener,
             level_ref.thread_tracker.lock().unwrap().as_mut(),
             gen_pool,
+            background_cpu_budget,
         );
 
         level_ref
@@ -301,7 +306,11 @@ impl Level {
     pub fn spawn_entity_generation(self: &Arc<Self>, pos: Vector2<i32>) {
         let level = self.clone();
         if let Some(pool) = &self.gen_pool {
+            let budget = self.background_cpu_budget.clone();
             pool.spawn(move || {
+                let _permit = budget
+                    .as_deref()
+                    .map(|budget| budget.acquire(BackgroundCpuCategory::Generation));
                 let arc_chunk = Arc::new(ChunkEntityData {
                     x: pos.x,
                     z: pos.y,
