@@ -1,0 +1,28 @@
+name: Automation 2482 lockfile fix
+
+on:
+  push:
+    branches:
+      - automation/2482-lockfix
+
+permissions:
+  contents: write
+
+jobs:
+  fix-lockfile:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: perf/buffer-java-encryption-writes-main
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Regenerate lockfile metadata
+        run: cargo check -p pumpkin-protocol
+      - name: Commit lockfile only
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Cargo.lock
+          git diff --cached --quiet || git commit -m "chore: regenerate lockfile"
+          git push origin HEAD:perf/buffer-java-encryption-writes-main
