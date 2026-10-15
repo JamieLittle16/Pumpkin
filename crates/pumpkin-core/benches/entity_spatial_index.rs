@@ -144,6 +144,15 @@ fn compare_update_cost(c: &mut Criterion) {
         });
         let first_inside = area(1.0, 7.0);
         let second_inside = area(1.4, 7.0);
+        let baseline_bounds = AtomicCell::new(first_inside);
+        let mut baseline_toggle = false;
+        group.bench_with_input(BenchmarkId::new("original_bbox_store", count), &count, |b, _| {
+            b.iter(|| {
+                let next = if baseline_toggle { first_inside } else { second_inside };
+                baseline_toggle = !baseline_toggle;
+                baseline_bounds.store(black_box(next));
+            })
+        });
         group.bench_with_input(BenchmarkId::new("same_cell_bbox_store", count), &count, |b, _| {
             b.iter(|| {
                 let new_bounds = if toggle { first_inside } else { second_inside };
