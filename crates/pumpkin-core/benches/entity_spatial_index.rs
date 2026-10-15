@@ -56,6 +56,30 @@ fn setup(count: usize, concentrated: bool) -> (Vec<Arc<Mock>>, EntityGrid<Arc<Mo
     (entities, index, query)
 }
 
+/// Check the complete ordered identity list against the former world-wide scan.
+fn assert_query_matches_oracle(
+    entities: &[Arc<Mock>],
+    index: &EntityGrid<Arc<Mock>>,
+    bounds: &BoundingBox,
+) {
+    let baseline: Vec<_> = entities
+        .iter()
+        .filter(|entity| entity.bounds.load().intersects(bounds))
+        .cloned()
+        .collect();
+    let indexed = index
+        .query(bounds, false, |entity| entity.bounds.load().intersects(bounds))
+        .unwrap_or_default();
+    assert_eq!(indexed.len(), baseline.len(), "fixture oracle length mismatch");
+    assert!(
+        indexed
+            .iter()
+            .zip(&baseline)
+            .all(|(left, right)| Arc::ptr_eq(left, right)),
+        "fixture oracle entity identities or ordering differ"
+    );
+}
+
 fn compare_queries(c: &mut Criterion) {
     let mut group = c.benchmark_group("entity_spatial_query");
     group.sample_size(50);
@@ -66,18 +90,7 @@ fn compare_queries(c: &mut Criterion) {
         let layout = if concentrated { "cluster" } else { "spread" };
         for count in [16, 32, 64, 128, 256, 512, 1024, 4096] {
             let (entities, index, bounds) = setup(count, concentrated);
-            let baseline: Vec<_> = entities.iter()
-                .filter(|entity| entity.bounds.load().intersects(&bounds))
-                .cloned()
-                .collect();
-            let indexed = index.query(&bounds, false, |entity| {
-                entity.bounds.load().intersects(&bounds)
-            }).unwrap_or_default();
-            assert_eq!(indexed.len(), baseline.len(), "fixture oracle length mismatch");
-            assert!(
-                indexed.iter().zip(&baseline).all(|(left, right)| Arc::ptr_eq(left, right)),
-                "fixture oracle entity identities or ordering differ"
-            );
+            assert_query_matches_oracle(&entities, &index, &bounds);
             let index = RwLock::new(index);
             let world_entities = ArcSwap::from_pointee(entities.clone());
 
