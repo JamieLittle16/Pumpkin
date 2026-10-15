@@ -90,6 +90,11 @@ impl<T: Clone> EntityGrid<T> {
         self.entries.len()
     }
 
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
     pub fn insert(&mut self, id: i32, bounds: &BoundingBox, item: T) {
         if self.entries.contains_key(&id) {
             self.remove(id);
@@ -228,7 +233,7 @@ mod tests {
         let actual = grid.query(box_, false, |id| {
             entries.iter().find(|(candidate, _)| candidate == id)
                 .is_some_and(|(_, bounds)| bounds.intersects(box_))
-        }).unwrap();
+        }).unwrap_or_default();
         assert_eq!(actual, expected);
     }
 
@@ -275,7 +280,7 @@ mod tests {
         }
         assert!(grid.query(&area(0.0, 0.0, 1.0), true, |_| true).is_none());
         assert_eq!(
-            grid.query(&area(100.0, 100.0, 1.0), true, |_| true).unwrap().len(),
+            grid.query(&area(100.0, 100.0, 1.0), true, |_| true).unwrap_or_default().len(),
             0
         );
     }

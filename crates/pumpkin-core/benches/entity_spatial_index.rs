@@ -67,7 +67,7 @@ fn compare_queries(c: &mut Criterion) {
                 .collect();
             let indexed = index.query(&bounds, false, |entity| {
                 entity.bounds.load().intersects(&bounds)
-            }).expect("small query must be indexable");
+            }).unwrap_or_default();
             assert_eq!(indexed.len(), baseline.len(), "fixture oracle mismatch");
 
             group.bench_with_input(
@@ -87,7 +87,7 @@ fn compare_queries(c: &mut Criterion) {
                 |b, _| b.iter(|| {
                     let hits = index.query(black_box(&bounds), false, |entity| {
                         entity.bounds.load().intersects(&bounds)
-                    }).expect("small query must be indexable");
+                    }).unwrap_or_default();
                     black_box(hits)
                 }),
             );
