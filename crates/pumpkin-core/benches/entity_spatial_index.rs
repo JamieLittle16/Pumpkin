@@ -4,6 +4,7 @@
 //! Use identical hardware and a release profile for every comparison.
 //! Query fixtures and setup are outside the timed closures.
 
+use arc_swap::ArcSwap;
 use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
 use crossbeam::atomic::AtomicCell;
 use pumpkin_core::world::entity_spatial_index::EntityGrid;
@@ -75,12 +76,14 @@ fn compare_queries(c: &mut Criterion) {
             }).unwrap_or_default();
             assert_eq!(indexed.len(), baseline.len(), "fixture oracle mismatch");
             let index = RwLock::new(index);
+            let world_entities = ArcSwap::from_pointee(entities.clone());
 
             group.bench_with_input(
                 BenchmarkId::new(format!("{layout}/linear"), count),
                 &count,
                 |b, _| b.iter(|| {
-                    let hits: Vec<_> = entities.iter()
+                    let snapshot = world_entities.load();
+                    let hits: Vec<_> = snapshot.iter()
                         .filter(|entity| entity.bounds.load().intersects(black_box(&bounds)))
                         .cloned()
                         .collect();
@@ -103,17 +106,24 @@ fn compare_queries(c: &mut Criterion) {
                 BenchmarkId::new(format!("{layout}/adaptive"), count),
                 &count,
                 |b, _| b.iter(|| {
-                    let hits = index.read()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .query(black_box(&bounds), true, |entity| {
-                            entity.bounds.load().intersects(&bounds)
-                        }).unwrap_or_else(|| {
-                        entities.iter()
+                    let snapshot = world_entities.load();
+                    if snapshot.len() < pumpkin_core::world::entity_spatial_index::MIN_INDEX_ENTITIES {
+                        let hits: Vec<_> = snapshot.iter()
                             .filter(|entity| entity.bounds.load().intersects(&bounds))
-                            .cloned()
-                            .collect()
-                    });
-                    black_box(hits)
+                            .cloned().collect();
+                        black_box(hits)
+                    } else {
+                        drop(snapshot);
+                        let indexed = index.read()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .query(black_box(&bounds), true, |entity| {
+                                entity.bounds.load().intersects(&bounds)
+                            });
+                        let hits = indexed.unwrap_or_else(|| world_entities.load().iter()
+                            .filter(|entity| entity.bounds.load().intersects(&bounds))
+                            .cloned().collect());
+                        black_box(hits)
+                    }
                 }),
             );
         }
