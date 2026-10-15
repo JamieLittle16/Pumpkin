@@ -8,10 +8,11 @@ use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_ma
 use crossbeam::atomic::AtomicCell;
 use pumpkin_core::world::entity_spatial_index::EntityGrid;
 use pumpkin_util::math::{boundingbox::BoundingBox, vector3::Vector3};
-use std::{sync::Arc, time::Duration};
+use std::{sync::{Arc, Mutex, RwLock}, time::Duration};
 
 struct Mock {
     bounds: AtomicCell<BoundingBox>,
+    bounds_lock: Mutex<()>,
 }
 
 fn area(x: f64, z: f64) -> BoundingBox {
@@ -33,7 +34,7 @@ fn setup(count: usize, concentrated: bool) -> (Vec<Arc<Mock>>, EntityGrid<Arc<Mo
              ((i * 173) % 65519) as f64 - 32759.0)
         };
         let bounds = area(x, z);
-        let entity = Arc::new(Mock { bounds: AtomicCell::new(bounds) });
+        let entity = Arc::new(Mock { bounds: AtomicCell::new(bounds), bounds_lock: Mutex::new(()) });
         index.insert(i as i32, &bounds, entity.clone());
         entities.push(entity);
     }
@@ -69,6 +70,7 @@ fn compare_queries(c: &mut Criterion) {
                 entity.bounds.load().intersects(&bounds)
             }).unwrap_or_default();
             assert_eq!(indexed.len(), baseline.len(), "fixture oracle mismatch");
+            let index = RwLock::new(index);
 
             group.bench_with_input(
                 BenchmarkId::new(format!("{layout}/linear"), count),
@@ -85,9 +87,11 @@ fn compare_queries(c: &mut Criterion) {
                 BenchmarkId::new(format!("{layout}/indexed"), count),
                 &count,
                 |b, _| b.iter(|| {
-                    let hits = index.query(black_box(&bounds), false, |entity| {
-                        entity.bounds.load().intersects(&bounds)
-                    }).unwrap_or_default();
+                    let hits = index.read()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .query(black_box(&bounds), false, |entity| {
+                            entity.bounds.load().intersects(&bounds)
+                        }).unwrap_or_default();
                     black_box(hits)
                 }),
             );
@@ -95,9 +99,11 @@ fn compare_queries(c: &mut Criterion) {
                 BenchmarkId::new(format!("{layout}/adaptive"), count),
                 &count,
                 |b, _| b.iter(|| {
-                    let hits = index.query(black_box(&bounds), true, |entity| {
-                        entity.bounds.load().intersects(&bounds)
-                    }).unwrap_or_else(|| {
+                    let hits = index.read()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .query(black_box(&bounds), true, |entity| {
+                            entity.bounds.load().intersects(&bounds)
+                        }).unwrap_or_else(|| {
                         entities.iter()
                             .filter(|entity| entity.bounds.load().intersects(&bounds))
                             .cloned()
@@ -118,7 +124,8 @@ fn compare_update_cost(c: &mut Criterion) {
     group.sample_size(50);
     group.measurement_time(Duration::from_secs(3));
     for count in [32, 128, 512, 2048] {
-        let (entities, mut index, _) = setup(count, false);
+        let (entities, index, _) = setup(count, false);
+        let index = RwLock::new(index);
         let mut toggle = false;
         let first = area(-0.4, 7.0);
         let second = area(16.4, 7.0);
@@ -126,7 +133,11 @@ fn compare_update_cost(c: &mut Criterion) {
             b.iter(|| {
                 let new_bounds = if toggle { first } else { second };
                 toggle = !toggle;
-                index.update(0, black_box(&new_bounds));
+                let _entity_guard = entities[0].bounds_lock.lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let mut grid = index.write()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                grid.update(0, black_box(&new_bounds));
                 entities[0].bounds.store(new_bounds);
                 black_box(&index);
             })
@@ -137,14 +148,18 @@ fn compare_update_cost(c: &mut Criterion) {
             b.iter(|| {
                 let new_bounds = if toggle { first_inside } else { second_inside };
                 toggle = !toggle;
-                // Production fast path: same_cells() then publish the bbox, no grid mutation.
+                // Production path includes the per-entity mutex.
+                let _entity_guard = entities[0].bounds_lock.lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
                 if pumpkin_core::world::entity_spatial_index::same_cells(
                     &entities[0].bounds.load(),
                     &new_bounds,
                 ) {
                     entities[0].bounds.store(new_bounds);
                 } else {
-                    index.update(0, &new_bounds);
+                    let mut grid = index.write()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    grid.update(0, &new_bounds);
                     entities[0].bounds.store(new_bounds);
                 }
                 black_box(&index);
