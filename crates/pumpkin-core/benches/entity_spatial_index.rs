@@ -1,15 +1,15 @@
 //! Compare real broad-phase candidate selection against the previous linear scan.
 //!
-//! Run: cargo bench -p pumpkin-core --bench entity_spatial_index -- --noplot
+//! Run: `cargo bench -p pumpkin-core --bench entity_spatial_index -- --noplot`
 //! Use identical hardware and a release profile for every comparison.
 //! Query fixtures and setup are outside the timed closures.
 
 use arc_swap::ArcSwap;
-use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
+use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use crossbeam::atomic::AtomicCell;
 use pumpkin_core::world::entity_spatial_index::EntityGrid;
 use pumpkin_util::math::{boundingbox::BoundingBox, vector3::Vector3};
-use std::{sync::{Arc, Mutex, RwLock}, time::Duration};
+use std::{hint::black_box, sync::{Arc, Mutex, RwLock}, time::Duration};
 
 struct Mock {
     bounds: AtomicCell<BoundingBox>,
@@ -66,46 +66,54 @@ fn compare_queries(c: &mut Criterion) {
         let layout = if concentrated { "cluster" } else { "spread" };
         for count in [16, 32, 64, 128, 256, 512, 1024, 4096] {
             let (entities, index, bounds) = setup(count, concentrated);
-            let baseline: Vec<usize> = entities.iter()
-                .enumerate()
-                .filter(|(_, entity)| entity.bounds.load().intersects(&bounds))
-                .map(|(i, _)| i)
+            let baseline: Vec<_> = entities.iter()
+                .filter(|entity| entity.bounds.load().intersects(&bounds))
+                .cloned()
                 .collect();
             let indexed = index.query(&bounds, false, |entity| {
                 entity.bounds.load().intersects(&bounds)
             }).unwrap_or_default();
-            assert_eq!(indexed.len(), baseline.len(), "fixture oracle mismatch");
+            assert_eq!(indexed.len(), baseline.len(), "fixture oracle length mismatch");
+            assert!(
+                indexed.iter().zip(&baseline).all(|(left, right)| Arc::ptr_eq(left, right)),
+                "fixture oracle entity identities or ordering differ"
+            );
             let index = RwLock::new(index);
             let world_entities = ArcSwap::from_pointee(entities.clone());
 
             group.bench_with_input(
                 BenchmarkId::new(format!("{layout}/linear"), count),
                 &count,
-                |b, _| b.iter(|| {
+                |b, _| {
+                    b.iter(|| {
                     let snapshot = world_entities.load();
                     let hits: Vec<_> = snapshot.iter()
                         .filter(|entity| entity.bounds.load().intersects(black_box(&bounds)))
                         .cloned()
                         .collect();
                     black_box(hits)
-                }),
+                    });
+                },
             );
             group.bench_with_input(
                 BenchmarkId::new(format!("{layout}/indexed"), count),
                 &count,
-                |b, _| b.iter(|| {
+                |b, _| {
+                    b.iter(|| {
                     let hits = index.read()
                         .unwrap_or_else(std::sync::PoisonError::into_inner)
                         .query(black_box(&bounds), false, |entity| {
                             entity.bounds.load().intersects(&bounds)
                         }).unwrap_or_default();
                     black_box(hits)
-                }),
+                    });
+                },
             );
             group.bench_with_input(
                 BenchmarkId::new(format!("{layout}/adaptive"), count),
                 &count,
-                |b, _| b.iter(|| {
+                |b, _| {
+                    b.iter(|| {
                     let snapshot = world_entities.load();
                     if snapshot.len() < pumpkin_core::world::entity_spatial_index::MIN_INDEX_ENTITIES {
                         let hits: Vec<_> = snapshot.iter()
@@ -124,7 +132,8 @@ fn compare_queries(c: &mut Criterion) {
                             .cloned().collect());
                         black_box(hits)
                     }
-                }),
+                    });
+                },
             );
         }
     }
@@ -154,7 +163,7 @@ fn compare_update_cost(c: &mut Criterion) {
                 grid.update(0, black_box(&new_bounds));
                 entities[0].bounds.store(new_bounds);
                 black_box(&index);
-            })
+            });
         });
         let first_inside = area(1.0, 7.0);
         let second_inside = area(1.4, 7.0);
@@ -165,7 +174,7 @@ fn compare_update_cost(c: &mut Criterion) {
                 let next = if baseline_toggle { first_inside } else { second_inside };
                 baseline_toggle = !baseline_toggle;
                 baseline_bounds.store(black_box(next));
-            })
+            });
         });
         group.bench_with_input(BenchmarkId::new("same_cell_bbox_store", count), &count, |b, _| {
             b.iter(|| {
@@ -174,19 +183,22 @@ fn compare_update_cost(c: &mut Criterion) {
                 // Production path includes the per-entity mutex.
                 let _entity_guard = entities[0].bounds_lock.lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
-                if pumpkin_core::world::entity_spatial_index::same_cells(
+                let guard = if pumpkin_core::world::entity_spatial_index::same_cells(
                     &entities[0].bounds.load(),
                     &new_bounds,
                 ) {
-                    entities[0].bounds.store(new_bounds);
+                    None
                 } else {
                     let mut grid = index.write()
                         .unwrap_or_else(std::sync::PoisonError::into_inner);
                     grid.update(0, &new_bounds);
-                    entities[0].bounds.store(new_bounds);
-                }
+                    Some(grid)
+                };
+                // Publish while the index write lock remains held if membership changed.
+                entities[0].bounds.store(new_bounds);
+                drop(guard);
                 black_box(&index);
-            })
+            });
         });
     }
     group.finish();
