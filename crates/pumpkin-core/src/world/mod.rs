@@ -4845,17 +4845,20 @@ impl World {
         self.entity_tracker.add_entity(&entity, self);
         self.spawn_state.load().add_entity(self, entity.as_ref());
 
-        {
-            let mut index = self.entity_grid.write()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            self.entities.rcu(|current_entities| {
-                let mut new_entities = (**current_entities).clone();
-                new_entities.push(entity.clone());
-                new_entities
-            });
-            index.insert(entity.get_entity().entity_id,
-                &entity.get_entity().bounding_box.load(), entity.clone())
-        };
+        let mut index = self.entity_grid.write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.entities.rcu(|current_entities| {
+            let mut new_entities = (**current_entities).clone();
+            new_entities.push(entity.clone());
+            new_entities
+        });
+        index.insert(
+            entity.get_entity().entity_id,
+            &entity.get_entity().bounding_box.load(),
+            entity.clone(),
+        );
+        // Rider insertion can recursively add entities, so release the index first.
+        drop(index);
         self.add_pending_riders(&entity);
     }
 
@@ -4942,17 +4945,20 @@ impl World {
         self.spawn_state.load().add_entity(self, entity.as_ref());
         self.entity_tracker.add_entity(&entity, self);
 
-        {
-            let mut index = self.entity_grid.write()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            self.entities.rcu(|current_entities| {
-                let mut new_entities = (**current_entities).clone();
-                new_entities.push(entity.clone());
-                new_entities
-            });
-            index.insert(entity.get_entity().entity_id,
-                &entity.get_entity().bounding_box.load(), entity.clone())
-        };
+        let mut index = self.entity_grid.write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.entities.rcu(|current_entities| {
+            let mut new_entities = (**current_entities).clone();
+            new_entities.push(entity.clone());
+            new_entities
+        });
+        index.insert(
+            entity.get_entity().entity_id,
+            &entity.get_entity().bounding_box.load(),
+            entity.clone(),
+        );
+        // Rider insertion can recursively add entities, so release the index first.
+        drop(index);
         self.add_pending_riders(&entity);
     }
 
