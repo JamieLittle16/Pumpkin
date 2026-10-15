@@ -4383,6 +4383,13 @@ impl World {
 
     // Gets all non-player entities at a box; dense or tiny inputs use the original scan.
     pub fn get_entities_at_box(&self, aabb: &BoundingBox) -> Vec<Arc<dyn EntityBase>> {
+        let entities = self.entities.load();
+        if entities.len() < entity_spatial_index::MIN_INDEX_ENTITIES {
+            return entities.iter()
+                .filter(|entity| entity.get_entity().bounding_box.load().intersects(aabb))
+                .cloned().collect();
+        }
+        drop(entities);
         let indexed = self.entity_grid.read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .query(aabb, true, |entity| {

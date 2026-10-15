@@ -8,7 +8,8 @@ use rustc_hash::{FxHashMap, FxHashSet};
 
 const MAX_INDEXED_CELLS: i64 = 16;
 const MAX_QUERY_CELLS: i64 = 64;
-const MIN_INDEX_ENTITIES: usize = 64;
+/// Queries on smaller worlds bypass the index to avoid fixed per-query overhead.
+pub const MIN_INDEX_ENTITIES: usize = 64;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct CellSpan {
