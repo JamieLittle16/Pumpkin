@@ -29,9 +29,13 @@ fn setup(count: usize, concentrated: bool) -> (Vec<Arc<Mock>>, EntityGrid<Arc<Mo
         let (x, z) = if concentrated {
             ((i % 8) as f64, ((i / 8) % 8) as f64)
         } else {
-            // Deterministic scattered map with no benchmark-time RNG.
-            (((i * 73) % 65521) as f64 - 32760.0,
-             ((i * 173) % 65519) as f64 - 32759.0)
+            // A realistic 32x32-chunk region (512x512 blocks).
+            // Scramble both coordinates independently, outside timed closures.
+            let h = (i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+            (
+                ((h >> 23) & 511) as f64 - 256.0,
+                ((h.rotate_left(19) >> 23) & 511) as f64 - 256.0,
+            )
         };
         let bounds = area(x, z);
         let entity = Arc::new(Mock { bounds: AtomicCell::new(bounds), bounds_lock: Mutex::new(()) });
