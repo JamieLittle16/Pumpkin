@@ -65,7 +65,7 @@ struct Entry<T> {
     sequence: u64,
 }
 
-/// The index is not synchronized internally: World guards it with an RwLock.
+/// The index is not synchronized internally: `World` guards it with an `RwLock`.
 /// Queries return None when scanning the original entity vector is likely cheaper.
 pub struct EntityGrid<T> {
     entries: FxHashMap<i32, Entry<T>>,
