@@ -896,6 +896,7 @@ pub struct Entity {
     pub pose: AtomicCell<EntityPose>,
     /// The bounding box of an entity (hitbox)
     pub bounding_box: AtomicCell<BoundingBox>,
+    bounds_update_lock: std::sync::Mutex<()>,
     ///The size (width and height) of the bounding box
     pub entity_dimension: AtomicCell<EntityDimensions>,
     /// Whether this entity is invulnerable to all damage
@@ -1055,6 +1056,7 @@ impl Entity {
                 &bounding_box_size,
             )),
             entity_dimension: AtomicCell::new(bounding_box_size),
+            bounds_update_lock: std::sync::Mutex::new(()),
             invulnerable: AtomicBool::new(false),
             damage_immunities: std::sync::Mutex::new(Vec::new()),
             data: AtomicI32::new(0),
@@ -1312,11 +1314,27 @@ impl Entity {
     /// Updates the entity's position, block position, and chunk position.
     ///
     /// This function calculates the new position, block position, and chunk position based on the provided coordinates. If any of these values change, the corresponding fields are updated.
+    /// Update hitbox and spatial membership consistently, using no global lock
+    /// when the footprint stays in the same indexed cells.
+    pub(crate) fn set_indexed_bounding_box(&self, new_bounds: BoundingBox) {
+        let _guard = self.bounds_update_lock.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if crate::world::entity_spatial_index::same_cells(
+            &self.bounding_box.load(), &new_bounds
+        ) {
+            self.bounding_box.store(new_bounds);
+        } else {
+            self.world.load().update_entity_bounds(
+                self.entity_id, &self.bounding_box, new_bounds
+            );
+        }
+    }
+
     pub fn set_pos(&self, new_position: Vector3<f64>) {
         let pos = self.pos.load();
         if pos != new_position {
             self.pos.store(new_position);
-            self.bounding_box.store(BoundingBox::new_from_pos(
+            self.set_indexed_bounding_box(BoundingBox::new_from_pos(
                 new_position.x,
                 new_position.y,
                 new_position.z,
@@ -3051,7 +3069,7 @@ impl Entity {
         let position = self.pos.load();
         let aabb = BoundingBox::new_from_pos(position.x, position.y, position.z, &dimension);
         self.pose.store(pose);
-        self.bounding_box.store(aabb);
+        self.set_indexed_bounding_box(aabb);
         self.entity_dimension.store(dimension);
         let pose = pose as i32;
         let mut bedrock_meta = SyncedActorDataList::new();

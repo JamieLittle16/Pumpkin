@@ -56,7 +56,7 @@ impl InteractionEntity {
         let dimensions = EntityDimensions::new(width, height, height * 0.85);
         let pos = entity.pos.load();
         let aabb = BoundingBox::new_from_pos(pos.x, pos.y, pos.z, &dimensions);
-        entity.bounding_box.store(aabb);
+        entity.set_indexed_bounding_box(aabb);
 
         Arc::new(Self {
             entity,
@@ -124,7 +124,7 @@ impl InteractionEntity {
         let dimensions = EntityDimensions::new(width, height, height * 0.85);
         let pos = self.entity.pos.load();
         let aabb = BoundingBox::new_from_pos(pos.x, pos.y, pos.z, &dimensions);
-        self.entity.bounding_box.store(aabb);
+        self.entity.set_indexed_bounding_box(aabb);
     }
 
     pub fn get_last_attacker(&self) -> Option<PlayerAction> {

@@ -118,6 +118,11 @@ xxhash-rust.workspace = true
 [dev-dependencies]
 tempfile.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
+criterion = { workspace = true, features = ["html_reports"] }
+
+[[bench]]
+name = "entity_spatial_index"
+harness = false
 
 [lints]
 workspace = true

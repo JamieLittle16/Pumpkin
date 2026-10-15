@@ -23,6 +23,7 @@ use tracing::{debug, error, info, trace, warn};
 mod active_chunks;
 pub mod brightness;
 pub mod chunker;
+pub mod entity_spatial_index;
 pub mod explosion;
 pub mod generation_cache;
 pub mod loot;
@@ -259,6 +260,8 @@ pub struct World {
     /// A map of active entities within the world, keyed by their unique UUID.
     /// This does not include players.
     pub entities: ArcSwap<Vec<Arc<dyn EntityBase>>>,
+    /// Spatial broad-phase for non-player entity queries.
+    entity_grid: RwLock<entity_spatial_index::EntityGrid<Arc<dyn EntityBase>>>,
     /// The world's scoreboard, used for tracking scores, objectives, and display information.
     pub scoreboard: std::sync::Mutex<Scoreboard>,
     /// The world's worldborder, defining the playable area and controlling its expansion or contraction.
@@ -401,6 +404,7 @@ impl World {
             level_info,
             players: ArcSwap::new(Arc::new(Vec::new())),
             entities: ArcSwap::new(Arc::new(Vec::new())),
+            entity_grid: RwLock::new(entity_spatial_index::EntityGrid::default()),
             scoreboard: std::sync::Mutex::new(Scoreboard::default()),
             worldborder: std::sync::Mutex::new(Worldborder::new(
                 0.0,
@@ -4377,14 +4381,27 @@ impl World {
             .collect()
     }
 
-    // Gets all non Player entities at a Box
+    // Gets all non-player entities at a box; dense or tiny inputs use the original scan.
     pub fn get_entities_at_box(&self, aabb: &BoundingBox) -> Vec<Arc<dyn EntityBase>> {
-        self.entities
-            .load()
-            .iter()
+        let indexed = self.entity_grid.read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .query(aabb, true, |entity| {
+                entity.get_entity().bounding_box.load().intersects(aabb)
+            });
+        indexed.unwrap_or_else(|| self.entities.load().iter()
             .filter(|entity| entity.get_entity().bounding_box.load().intersects(aabb))
-            .cloned()
-            .collect()
+            .cloned().collect())
+    }
+
+    /// Publish the new hitbox under the same lock as index membership changes.
+    pub(crate) fn update_entity_bounds(
+        &self, id: i32, bounds: &crossbeam::atomic::AtomicCell<BoundingBox>,
+        new_bounds: BoundingBox,
+    ) {
+        let mut index = self.entity_grid.write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        index.update(id, &new_bounds);
+        bounds.store(new_bounds);
     }
 
     // Gets all Player entities at a Box
@@ -4821,11 +4838,17 @@ impl World {
         self.entity_tracker.add_entity(&entity, self);
         self.spawn_state.load().add_entity(self, entity.as_ref());
 
-        self.entities.rcu(|current_entities| {
-            let mut new_entities = (**current_entities).clone();
-            new_entities.push(entity.clone());
-            new_entities
-        });
+        {
+            let mut index = self.entity_grid.write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            self.entities.rcu(|current_entities| {
+                let mut new_entities = (**current_entities).clone();
+                new_entities.push(entity.clone());
+                new_entities
+            });
+            index.insert(entity.get_entity().entity_id,
+                &entity.get_entity().bounding_box.load(), entity.clone());
+        }
         self.add_pending_riders(&entity);
     }
 
@@ -4912,11 +4935,17 @@ impl World {
         self.spawn_state.load().add_entity(self, entity.as_ref());
         self.entity_tracker.add_entity(&entity, self);
 
-        self.entities.rcu(|current_entities| {
-            let mut new_entities = (**current_entities).clone();
-            new_entities.push(entity.clone());
-            new_entities
-        });
+        {
+            let mut index = self.entity_grid.write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            self.entities.rcu(|current_entities| {
+                let mut new_entities = (**current_entities).clone();
+                new_entities.push(entity.clone());
+                new_entities
+            });
+            index.insert(entity.get_entity().entity_id,
+                &entity.get_entity().bounding_box.load(), entity.clone());
+        }
         self.add_pending_riders(&entity);
     }
 
@@ -4933,11 +4962,14 @@ impl World {
 
         self.spawn_state.load().remove_entity(self, entity);
         self.entity_tracker.remove_entity(entity, self);
+        let mut index = self.entity_grid.write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         self.entities.rcu(|current_entities| {
             let mut new_entities = (**current_entities).clone();
             new_entities.retain(|e| e.get_entity().entity_uuid != base_entity.entity_uuid);
             new_entities
         });
+        index.remove(base_entity.entity_id);
     }
 
     pub async fn remove_entities_in_chunks(
@@ -4950,21 +4982,27 @@ impl World {
         }
         let mut entities_to_remove = Vec::new();
 
-        self.entities.rcu(|current_entities| {
-            entities_to_remove.clear();
-            let mut new_entities = (**current_entities).clone();
-            new_entities.retain(|entity| {
-                let base_entity = entity.get_entity();
-                let pos = base_entity.chunk_pos.load();
-                if chunks_set.contains(&pos) {
-                    entities_to_remove.push(entity.clone());
-                    false
-                } else {
-                    true
-                }
+        {
+            let mut index = self.entity_grid.write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            self.entities.rcu(|current_entities| {
+                entities_to_remove.clear();
+                let mut new_entities = (**current_entities).clone();
+                new_entities.retain(|entity| {
+                    let base = entity.get_entity();
+                    if chunks_set.contains(&base.chunk_pos.load()) {
+                        entities_to_remove.push(entity.clone());
+                        false
+                    } else {
+                        true
+                    }
+                });
+                new_entities
             });
-            new_entities
-        });
+            for entity in &entities_to_remove {
+                index.remove(entity.get_entity().entity_id);
+            }
+        }
 
         self.save_entities_by_chunk(&entities_to_remove, chunks_set.iter().copied())
             .await;
