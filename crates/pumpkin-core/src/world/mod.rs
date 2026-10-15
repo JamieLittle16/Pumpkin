@@ -4854,8 +4854,8 @@ impl World {
                 new_entities
             });
             index.insert(entity.get_entity().entity_id,
-                &entity.get_entity().bounding_box.load(), entity.clone());
-        }
+                &entity.get_entity().bounding_box.load(), entity.clone())
+        };
         self.add_pending_riders(&entity);
     }
 
@@ -4951,8 +4951,8 @@ impl World {
                 new_entities
             });
             index.insert(entity.get_entity().entity_id,
-                &entity.get_entity().bounding_box.load(), entity.clone());
-        }
+                &entity.get_entity().bounding_box.load(), entity.clone())
+        };
         self.add_pending_riders(&entity);
     }
 
