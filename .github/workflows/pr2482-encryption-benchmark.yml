@@ -46,7 +46,7 @@ jobs:
             echo "Upstream: 10f1fde9367c827f168eaabdc8f343b1ce6f676c"
             echo "New in-place PR: eb57397997f1bbc306e03fb14eb4b85e8ae926a9"
             echo "October upstream: 5b53f064af8708ba33fcaa533b81ca29a53a3310"
-            echo "October buffered PR: 81ba76a113d859495feecad7c320df3aa50a0ac8
+            echo "October buffered PR: 81ba76a113d859495feecad7c320df3aa50a0ac8"
             echo "Runner: ubuntu-24.04, GitHub-hosted, shared virtual CPU"
             rustc --version
             cargo --version
