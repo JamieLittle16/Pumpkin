@@ -18,6 +18,21 @@ fn parameters(name: &str) -> (usize, usize) {
     }
 }
 
+
+async fn run_writes(original: &[u8], key: &[u8; 16], chunk: usize, count: usize) {
+    for _ in 0..count {
+        let mut frame = original.to_vec();
+        let buffered = BufWriter::with_capacity(8192, tokio::io::sink());
+        let mut encoder = TCPNetworkEncoder::new(buffered);
+        encoder.set_encryption(key).unwrap();
+        for bytes in frame.chunks_mut(chunk) {
+            encoder.write_frame(bytes).await.unwrap();
+        }
+        encoder.flush().await.unwrap();
+        black_box(frame);
+    }
+}
+
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
     let mut args = env::args().skip(1);
@@ -39,23 +54,9 @@ async fn main() {
 
     // Exercise the same per-connection encryption-setup and write path.
     // Include the frame copy in BOTH versions because the new API mutates input.
-    let run = |count: usize| async {
-        for _ in 0..count {
-            let mut frame = original.clone();
-            let buffered = BufWriter::with_capacity(8192, tokio::io::sink());
-            let mut encoder = TCPNetworkEncoder::new(buffered);
-            encoder.set_encryption(&key).unwrap();
-            for bytes in frame.chunks_mut(chunk) {
-                encoder.write_frame(bytes).await.unwrap();
-            }
-            encoder.flush().await.unwrap();
-            black_box(frame);
-        }
-    };
-
-    run((iterations / 10).max(2)).await;
+    run_writes(&original, &key, chunk, (iterations / 10).max(2)).await;
     let start = Instant::now();
-    run(iterations).await;
+    run_writes(&original, &key, chunk, iterations).await;
     let ns_per_iter = start.elapsed().as_nanos() as f64 / iterations as f64;
     println!("{ns_per_iter:.3}");
 }
