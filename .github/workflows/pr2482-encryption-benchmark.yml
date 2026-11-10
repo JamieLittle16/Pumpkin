@@ -10,7 +10,7 @@ permissions:
 
 jobs:
   compare:
-    name: Compare in-place vs upstream (release)
+    name: Four-way encryption implementation comparison
     runs-on: ubuntu-24.04
     timeout-minutes: 55
     steps:
@@ -23,7 +23,9 @@ jobs:
           set -euo pipefail
           git worktree add --detach "$RUNNER_TEMP/upstream" 10f1fde9367c827f168eaabdc8f343b1ce6f676c
           git worktree add --detach "$RUNNER_TEMP/candidate" eb57397997f1bbc306e03fb14eb4b85e8ae926a9
-          for version in upstream candidate; do
+          git worktree add --detach "$RUNNER_TEMP/upstream_oct" 5b53f064af8708ba33fcaa533b81ca29a53a3310
+          git worktree add --detach "$RUNNER_TEMP/legacy" 81ba76a113d859495feecad7c320df3aa50a0ac8
+          for version in upstream candidate upstream_oct legacy; do
             git -C "$RUNNER_TEMP/$version" submodule update --init --recursive
             mkdir -p "$RUNNER_TEMP/$version/crates/pumpkin-protocol/examples"
             cp crates/pumpkin-protocol/examples/pr2482_encryption_bench.rs "$RUNNER_TEMP/$version/crates/pumpkin-protocol/examples/pr2482_encryption_bench.rs"
@@ -31,7 +33,9 @@ jobs:
           mkdir -p benchmark-results
           {
             echo "Upstream: 10f1fde9367c827f168eaabdc8f343b1ce6f676c"
-            echo "PR: eb57397997f1bbc306e03fb14eb4b85e8ae926a9"
+            echo "New in-place PR: eb57397997f1bbc306e03fb14eb4b85e8ae926a9"
+            echo "October upstream: 5b53f064af8708ba33fcaa533b81ca29a53a3310"
+            echo "October buffered PR: 81ba76a113d859495feecad7c320df3aa50a0ac8
             echo "Runner: ubuntu-24.04, GitHub-hosted, shared virtual CPU"
             rustc --version
             cargo --version
@@ -43,7 +47,7 @@ jobs:
         run: |
           set -euo pipefail
           export CARGO_TARGET_DIR="$RUNNER_TEMP/pr2482-cargo-target"
-          for version in upstream candidate; do
+          for version in upstream candidate upstream_oct legacy; do
             echo "::group::Release build of $version"
             (cd "$RUNNER_TEMP/$version" && cargo build --locked --release -p pumpkin-protocol --example pr2482_encryption_bench)
             cp "$CARGO_TARGET_DIR/release/examples/pr2482_encryption_bench" "benchmark-results/bench-$version"
@@ -64,7 +68,8 @@ jobs:
           for trial in range(trials):
               print(f"Trial {trial+1}/{trials}", flush=True)
               for size, iterations in cases:
-                  order = ("upstream", "candidate") if trial % 2 == 0 else ("candidate", "upstream")
+                  versions = ("upstream_oct", "legacy", "upstream", "candidate")
+                  order = versions[trial % 4:] + versions[:trial % 4]
                   for version in order:
                       command = [str((output / f"bench-{version}").resolve()), str(size), str(iterations)]
                       raw = subprocess.check_output(command, text=True).strip()
@@ -82,40 +87,65 @@ jobs:
           for row in records:
               groups[(row["size"], row["version"])].append(row["ns_per_packet"])
           summary = []
-          print("\nMedians: positive change means the PR is faster", flush=True)
+          print("\nMedians: October buffered vs October upstream; November in-place vs November upstream", flush=True)
           for size, _ in cases:
-              old = statistics.median(groups[(size, "upstream")])
-              new = statistics.median(groups[(size, "candidate")])
-              old_mad = statistics.median(abs(x-old) for x in groups[(size, "upstream")])
-              new_mad = statistics.median(abs(x-new) for x in groups[(size, "candidate")])
-              noise_pct = max(100*old_mad/old, 100*new_mad/new)
-              row = {"size": size, "upstream_us": round(old/1000, 4),
-                     "candidate_us": round(new/1000, 4),
-                     "improvement_pct": round(100*(old-new)/old, 3),
-                     "max_mad_pct": round(noise_pct, 3)}
+              medians = {version: statistics.median(groups[(size, version)])
+                         for version in ("upstream_oct", "legacy", "upstream", "candidate")}
+              dispersions = {version: statistics.median(
+                  abs(x-medians[version]) for x in groups[(size, version)])
+                  for version in medians}
+              old_base = medians["upstream_oct"]
+              old_buffer = medians["legacy"]
+              new_base = medians["upstream"]
+              new_inplace = medians["candidate"]
+              old_gain = 100*(old_base-old_buffer)/old_base
+              new_gain = 100*(new_base-new_inplace)/new_base
+              base_shift = 100*(old_base-new_base)/old_base
+              noise_pct = max(100*dispersions[version]/medians[version] for version in medians)
+              row = {
+                  "size": size,
+                  "oct_upstream_us": round(old_base/1000, 4),
+                  "oct_buffered_us": round(old_buffer/1000, 4),
+                  "oct_buffered_gain_pct": round(old_gain, 3),
+                  "nov_upstream_us": round(new_base/1000, 4),
+                  "nov_inplace_us": round(new_inplace/1000, 4),
+                  "nov_inplace_gain_pct": round(new_gain, 3),
+                  "baseline_shift_pct": round(base_shift, 3),
+                  "max_mad_pct": round(noise_pct, 3)
+              }
               summary.append(row)
-              print(f"  {size:8} B: upstream {old/1000:.3f} us, PR {new/1000:.3f} us, "
-                    f"change {row['improvement_pct']:+.2f}%, noise MAD {noise_pct:.2f}%", flush=True)
+              print(
+                  f"  {size:8} B: Oct baseline {old_base/1000:.3f} us -> buffered "
+                  f"{old_buffer/1000:.3f} us ({old_gain:+.2f}%); Nov baseline "
+                  f"{new_base/1000:.3f} us -> in-place {new_inplace/1000:.3f} us "
+                  f"({new_gain:+.2f}%); baseline shift {base_shift:+.2f}%; "
+                  f"MAD noise {noise_pct:.2f}%", flush=True)
+
           with (output / "summary.csv").open("w", newline="") as file:
               w = csv.DictWriter(file, fieldnames=list(summary[0]))
               w.writeheader()
               w.writerows(summary)
           with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as file:
-              file.write("# PR 2482 encryption microbenchmark\n\n")
-              file.write("Release mode, same benchmark source and runner, 15 paired trials. "
-                         "**GitHub-hosted runners are noisy; not real TCP or server throughput.**\n\n")
-              file.write("| Payload (B) | Upstream (us/pkt) | PR (us/pkt) | Improvement | MAD noise |\n")
-              file.write("|---:|---:|---:|---:|---:|\n")
-              for r in summary:
-                  file.write(f"| {r['size']} | {r['upstream_us']} | {r['candidate_us']} | "
-                             f"{r['improvement_pct']:+.3f}% | {r['max_mad_pct']}% |\n")
+              file.write("# PR 2482 encryption microbenchmark (four-way)\n\n")
+              file.write("Same release benchmark source and runner; 15 trials of each revision. "
+                         "**Shared GitHub runner, in-memory output, no real network.**\n\n")
+              file.write("| Bytes | Oct upstream (us) | Oct buffered (us) | Old gain | "
+                         "Nov upstream (us) | Nov in-place (us) | New gain | "
+                         "Baseline shift | MAD noise |\n")
+              file.write("|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n")
+              for row in summary:
+                  file.write(
+                      f"| {row['size']} | {row['oct_upstream_us']} | {row['oct_buffered_us']} "
+                      f"| {row['oct_buffered_gain_pct']:+.3f}% | {row['nov_upstream_us']} "
+                      f"| {row['nov_inplace_us']} | {row['nov_inplace_gain_pct']:+.3f}% "
+                      f"| {row['baseline_shift_pct']:+.3f}% | {row['max_mad_pct']}% |\n")
           PY
 
       - name: Upload results
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: pr-2482-encryption-benchmark
+          name: pr-2482-four-way-encryption-benchmark
           path: |
             benchmark-results/raw.csv
             benchmark-results/summary.csv
