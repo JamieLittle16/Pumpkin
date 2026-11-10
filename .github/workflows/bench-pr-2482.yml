@@ -1,0 +1,57 @@
+name: PR 2482 isolated encryption microbench
+on:
+  push:
+    branches:
+      - bench/pr-2482-compare-2026-11-10
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  benchmark:
+    runs-on: ubuntu-latest
+    timeout-minutes: 55
+    env:
+      CARGO_PROFILE_RELEASE_LTO: "false"
+      CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
+      CARGO_TERM_COLOR: always
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: Swatinem/rust-cache@v2
+      - name: Create same-source benchmark in exact upstream and PR versions
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch https://github.com/Pumpkin-MC/Pumpkin.git 10f1fde9367c827f168eaabdc8f343b1ce6f676c --depth=1
+          git worktree add --detach "$RUNNER_TEMP/pr2482-upstream" 10f1fde9367c827f168eaabdc8f343b1ce6f676c
+          git worktree add --detach "$RUNNER_TEMP/pr2482-candidate" eb57397997f1bbc306e03fb14eb4b85e8ae926a9
+          for side in upstream candidate; do
+            mkdir -p "$RUNNER_TEMP/pr2482-$side/crates/pumpkin-protocol/examples"
+            cp .github/benchmarks/pr2482.rs "$RUNNER_TEMP/pr2482-$side/crates/pumpkin-protocol/examples/pr2482_comparison.rs"
+          done
+      - name: Compile upstream benchmark (release)
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/pr2482-upstream"
+          CARGO_TARGET_DIR="$RUNNER_TEMP/target-upstream" cargo build -p pumpkin-protocol --example pr2482_comparison --release --locked
+      - name: Compile candidate benchmark (same release settings)
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/pr2482-candidate"
+          CARGO_TARGET_DIR="$RUNNER_TEMP/target-candidate" cargo build -p pumpkin-protocol --example pr2482_comparison --release --locked
+      - name: Run interleaved paired timings and save raw data
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 .github/benchmarks/pr2482_runner.py \
+            "$RUNNER_TEMP/target-upstream/release/examples/pr2482_comparison" \
+            "$RUNNER_TEMP/target-candidate/release/examples/pr2482_comparison"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: pr2482-encryption-benchmark
+          path: pr-2482-benchmark.json
+          if-no-files-found: ignore
