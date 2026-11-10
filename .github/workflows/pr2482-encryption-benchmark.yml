@@ -30,6 +30,17 @@ jobs:
             mkdir -p "$RUNNER_TEMP/$version/crates/pumpkin-protocol/examples"
             cp crates/pumpkin-protocol/examples/pr2482_encryption_bench.rs "$RUNNER_TEMP/$version/crates/pumpkin-protocol/examples/pr2482_encryption_bench.rs"
           done
+          # The old PR deliberately used new_buffered(socket), not new(BufWriter(socket)).
+          # The latter would add an extra, non-production buffer layer.
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path("crates/pumpkin-protocol/examples/pr2482_encryption_bench.rs")
+          p = Path(__import__("os").environ["RUNNER_TEMP"]) / "legacy" / p
+          s = p.read_text()
+          source = "TCPNetworkEncoder::new(BufWriter::new(Sink(stats.clone())))"
+          assert s.count(source) == 1
+          p.write_text(s.replace(source, "TCPNetworkEncoder::new_buffered(Sink(stats.clone()))"))
+          PY
           mkdir -p benchmark-results
           {
             echo "Upstream: 10f1fde9367c827f168eaabdc8f343b1ce6f676c"
